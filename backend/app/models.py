@@ -1,0 +1,118 @@
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any
+from datetime import datetime, date # Keep date for potential other uses if any, but primary change is to datetime
+
+class Material(BaseModel):
+    id: str = Field(..., description="Unique material ID")
+    name: str
+    description: Optional[str] = None
+
+class ProductBOM(BaseModel):
+    material_id: str
+    quantity: int
+
+class Product(BaseModel):
+    id: str = Field(..., description="Unique product ID")
+    name: str
+    bom: List[ProductBOM] = Field(..., description="Bill of Materials")
+    production_time: int = Field(..., description="Time in days to produce one unit")
+
+class ProviderOffering(BaseModel):
+    material_id: str
+    price_per_unit: float
+    offered_unit_size: int = Field(1, description="e.g., 1 for single units, 100 for a pallet")
+    lead_time_days: int
+
+class Provider(BaseModel):
+    id: str = Field(..., description="Unique provider ID")
+    name: str
+    catalogue: List[ProviderOffering]
+
+class InventoryItem(BaseModel):
+    item_id: str
+    item_type: str
+    quantity: int
+
+class ProductionOrder(BaseModel):
+    id: str = Field(..., description="Unique production order ID")
+    product_id: str
+    quantity: int
+    requested_date: datetime
+    status: str = Field("Pending", description="Pending, In Progress, Completed, Cancelled")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    required_materials: Dict[str, int] = Field({}, description="Calculated total materials needed")
+
+class PurchaseOrder(BaseModel):
+    id: str = Field(..., description="Unique purchase order ID")
+    material_id: str
+    provider_id: str
+    quantity_ordered: int
+    units_received: int = 0
+    order_date: datetime
+    expected_arrival_date: datetime
+    actual_arrival_date: Optional[datetime] = None
+    status: str = Field("Ordered", description="Ordered, Arrived, Partially Arrived, Cancelled")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class SimulationEvent(BaseModel):
+    id: str = Field(..., description="Unique event ID")
+    day: int
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    event_type: str
+    details: Dict[str, Any]
+
+class SimulationState(BaseModel):
+    id: str = Field("singleton_state", description="Unique identifier for the simulation state document")
+    current_day: int = 0
+    inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity")
+    storage_capacity: int
+    daily_production_capacity: int
+    active_production_orders: List[str] = Field([], description="List of ProductionOrder IDs currently in progress")
+    pending_purchase_orders: List[str] = Field([], description="List of PurchaseOrder IDs not yet arrived")
+    is_initialized: bool = False
+
+class InitialConditions(BaseModel):
+    products: List[Product]
+    providers: List[Provider]
+    materials: List[Material]
+    initial_inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity")
+    storage_capacity: int = 10000
+    daily_production_capacity: int = 10
+    random_order_config: Dict[str, int] = Field({
+        "min_orders_per_day": 0,
+        "max_orders_per_day": 3,
+        "min_qty_per_order": 1,
+        "max_qty_per_order": 5
+    })
+
+class ProductionStartRequest(BaseModel):
+    order_ids: List[str]
+
+class PurchaseOrderRequest(BaseModel):
+    material_id: str
+    provider_id: str
+    quantity: int
+
+class StatusResponse(BaseModel):
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+class SimulationStatus(BaseModel):
+    current_day: int
+    total_inventory_units: int
+    storage_capacity: int
+    storage_utilization: float
+    pending_production_orders: int
+    in_progress_production_orders: int
+    pending_purchase_orders: int
+
+class DataExport(BaseModel):
+    simulation_state: SimulationState
+    events: List[SimulationEvent]
+    production_orders: List[ProductionOrder]
+    purchase_orders: List[PurchaseOrder]
+    products: List[Product]
+    providers: List[Provider]
+    materials: List[Material]

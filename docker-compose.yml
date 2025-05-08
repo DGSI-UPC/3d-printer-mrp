@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - DATABASE_NAME=mrp_simulation_db
+      # Add any other environment variables needed by the backend
+    volumes:
+      # Mount code for development (optional, remove for production image)
+      - ./backend/app:/app/app
+    depends_on:
+      - mongo
+    networks:
+      - mrp_net
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://backend:8000
+      # Set STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false if you face connection issues in dev
+      # Or configure CORS properly in production setups
+    volumes:
+      # Mount code for development (optional, remove for production image)
+      - ./frontend:/app
+    depends_on:
+      - backend
+    networks:
+      - mrp_net
+
+  mongo:
+    image: mongo:6.0 # Use a specific Mongo version
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db # Persist MongoDB data
+    networks:
+      - mrp_net
+
+networks:
+  mrp_net:
+    driver: bridge
+
+volumes:
+  mongo-data:
