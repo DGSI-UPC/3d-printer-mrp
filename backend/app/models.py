@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
-from datetime import datetime, date 
+from datetime import datetime, date
 
 class Material(BaseModel):
     id: str = Field(..., description="Unique material ID")
@@ -42,8 +42,8 @@ class ProductionOrder(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    required_materials: Dict[str, int] = Field({}, description="Calculated total materials needed")
-    committed_materials: Dict[str, int] = Field({}, description="Materials committed from inventory when order is accepted")
+    required_materials: Dict[str, int] = Field({}, description="Calculated total materials needed for the current quantity")
+    committed_materials: Dict[str, int] = Field({}, description="Materials committed from inventory when order is accepted or production starts")
 
 class PurchaseOrder(BaseModel):
     id: str = Field(..., description="Unique purchase order ID")
@@ -68,7 +68,7 @@ class SimulationState(BaseModel):
     id: str = Field("singleton_state", description="Unique identifier for the simulation state document")
     current_day: int = 0
     inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity (physical stock)")
-    committed_inventory: Dict[str, int] = Field({}, description="Tracks materials committed to accepted orders but not yet consumed by production")
+    committed_inventory: Dict[str, int] = Field({}, description="Tracks materials committed to accepted/in-progress orders but not yet consumed by production")
     storage_capacity: int
     daily_production_capacity: int
     active_production_orders: List[str] = Field([], description="List of ProductionOrder IDs currently in progress")
@@ -126,7 +126,7 @@ class InventoryDetail(BaseModel):
     name: str
     type: str # "Material" or "Product"
     physical: int = 0
-    committed: int = 0
+    committed: int = 0 # Total committed across all orders (accepted & in-progress)
     on_order: int = 0 # Only applicable to materials
     projected_available: int = 0
 
