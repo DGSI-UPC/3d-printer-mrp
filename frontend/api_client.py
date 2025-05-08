@@ -3,7 +3,7 @@ import streamlit as st
 import os
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
-import json 
+import json
 from datetime import datetime
 
 load_dotenv()
@@ -14,17 +14,17 @@ def handle_api_error(response: requests.Response, context: str):
     try:
         detail = response.json().get("detail", "No detail provided.")
     except json.JSONDecodeError:
-        detail = response.text 
+        detail = response.text
     st.error(f"API Error in {context}: {response.status_code} - {detail}")
-    return None 
+    return None
 
 def get_simulation_status() -> Optional[Dict]:
     try:
         response = requests.get(f"{API_URL}/simulation/status")
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 409: 
-            return None 
+        elif response.status_code == 409:
+            return None
         else:
             handle_api_error(response, "fetching simulation status")
             return None
@@ -138,6 +138,19 @@ def accept_production_order(order_id: str) -> bool:
         st.error(f"Network error accepting production order {order_id}: {e}")
         return False
 
+def fulfill_accepted_production_order_from_stock(order_id: str) -> bool:
+    try:
+        response = requests.post(f"{API_URL}/production/orders/{order_id}/fulfill_accepted_from_stock")
+        if response.status_code == 200:
+            st.success(response.json().get("message", f"Order {order_id} fulfillment from stock processed."))
+            return True
+        else:
+            handle_api_error(response, f"fulfilling accepted order {order_id} from stock")
+            return False
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error fulfilling accepted order {order_id} from stock: {e}")
+        return False
+
 def order_missing_materials_for_production_order(order_id: str) -> Optional[Dict]:
     try:
         response = requests.post(f"{API_URL}/production/orders/{order_id}/order_missing_materials")
@@ -213,10 +226,11 @@ def create_purchase_order(material_id: str, provider_id: str, quantity: int) -> 
             arrival_date_str = "N/A"
             if arrival_date:
                 try:
-                    parsed_date = datetime.fromisoformat(arrival_date.replace("Z", "+00:00")) if isinstance(arrival_date, str) else datetime.fromtimestamp(arrival_date) if isinstance(arrival_date, (int, float)) else None # Handle different possible date inputs
+                    # Handle different possible date inputs (ISO string, timestamp)
+                    parsed_date = datetime.fromisoformat(arrival_date.replace("Z", "+00:00")) if isinstance(arrival_date, str) else datetime.fromtimestamp(arrival_date) if isinstance(arrival_date, (int, float)) else None
                     if parsed_date: arrival_date_str = parsed_date.strftime('%Y-%m-%d')
                 except (ValueError, TypeError):
-                    arrival_date_str = str(arrival_date) 
+                    arrival_date_str = str(arrival_date)
             st.success(f"Purchase Order {po.get('id')} created successfully. Expected arrival: {arrival_date_str}")
             return True
         else:
@@ -236,7 +250,7 @@ def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for Inven
         response = requests.get(f"{API_URL}/inventory")
         if response.status_code == 200:
             return response.json() # This will be InventoryStatusResponse model output
-        elif response.status_code == 409: 
+        elif response.status_code == 409:
             return {"items": {}} # Return empty structure for items
         else:
             handle_api_error(response, "fetching inventory")
@@ -276,7 +290,7 @@ def import_data(data: Dict) -> bool:
         response = requests.post(f"{API_URL}/data/import", json=data)
         if response.status_code == 200:
             st.success("Data imported successfully! Refreshing data...")
-            st.rerun() 
+            st.rerun()
             return True
         else:
             handle_api_error(response, "importing data")

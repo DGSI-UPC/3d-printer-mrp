@@ -19,17 +19,17 @@ current_simulation: Optional[FactorySimulation] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await database.connect_to_mongo()
-    await load_simulation_state() 
+    await load_simulation_state()
     yield
     await database.close_mongo_connection()
 
 async def load_simulation_state():
     global current_simulation
     logger.info("Attempting to load simulation state...")
-    state_dict = await crud.get_simulation_state() 
-    
+    state_dict = await crud.get_simulation_state()
+
     if state_dict:
-        state_dict.setdefault('committed_inventory', {}) 
+        state_dict.setdefault('committed_inventory', {})
         state = SimulationState(**state_dict)
     else:
         state = None
@@ -50,8 +50,8 @@ async def load_simulation_state():
         logger.info("No valid simulation state found or base data missing. Simulation needs initialization.")
         if not state:
              default_state = SimulationState(
-                 storage_capacity=0, 
-                 daily_production_capacity=0, 
+                 storage_capacity=0,
+                 daily_production_capacity=0,
                  is_initialized=False,
                  committed_inventory={}
             )
@@ -95,18 +95,13 @@ async def initialize_simulation(initial_conditions: InitialConditions):
     initial_state = SimulationState(
         current_day=0,
         inventory=initial_conditions.initial_inventory,
-        committed_inventory={}, 
+        committed_inventory={},
         storage_capacity=initial_conditions.storage_capacity,
         daily_production_capacity=initial_conditions.daily_production_capacity,
         is_initialized=True
     )
     saved_state = await crud.save_simulation_state(initial_state)
 
-    # Need to pass the Pydantic models, not dicts, to FactorySimulation if it expects them for lookups
-    # Or adjust FactorySimulation to take lists of dicts and convert internally.
-    # Current FactorySimulation takes lists of Pydantic models.
-    
-    # Fetch them back as models after saving, or pass initial_conditions.* directly
     materials_models = initial_conditions.materials
     products_models = initial_conditions.products
     providers_models = initial_conditions.providers
@@ -141,9 +136,9 @@ async def get_simulation_status_api():
         pending_prod = await crud.get_items(crud.COLLECTIONS["production_orders"], {"status": "Pending"})
         accepted_prod = await crud.get_items(crud.COLLECTIONS["production_orders"], {"status": "Accepted"})
         in_progress_prod = await crud.get_items(crud.COLLECTIONS["production_orders"], {"status": "In Progress"})
-        
+
         pending_purch_count = len(state.pending_purchase_orders) # Count of PO documents
-        total_units = sim.get_total_inventory_units() 
+        total_units = sim.get_total_inventory_units()
         utilization = (total_units / state.storage_capacity * 100) if state.storage_capacity > 0 else 0
 
         return SimulationStatus(
@@ -186,13 +181,13 @@ async def list_providers_api(): # Renamed
 async def list_production_orders(status: Optional[str] = Query(None, description="Filter by status (e.g., Pending, Accepted, In Progress, Fulfilled)")):
     query = {"status": status} if status else {}
     items_raw = await crud.get_all_items(crud.COLLECTIONS["production_orders"], query=query)
-    
+
     orders = []
     for item_data in items_raw:
         item_data.setdefault('required_materials', {})
         item_data.setdefault('committed_materials', {})
         orders.append(ProductionOrder(**item_data))
-        
+
     orders.sort(key=lambda x: x.created_at, reverse=True)
     return orders
 
@@ -206,20 +201,42 @@ async def get_production_order(order_id: str):
     return ProductionOrder(**item)
 
 @app.post("/production/orders/{order_id}/accept", response_model=StatusResponse)
-async def accept_production_order_api(order_id: str): 
+async def accept_production_order_api(order_id: str):
     sim = get_sim()
     try:
         success, message = await sim.accept_production_order(order_id)
         if success:
             return StatusResponse(message=message)
         else:
-            raise HTTPException(status_code=400, detail=message)
+            # Distinguish between client error (400/409) and server error (500)
+            if "cannot be accepted" in message.lower() or "insufficient" in message.lower(): # Typical for material shortage
+                 raise HTTPException(status_code=409, detail=message) # Conflict, cannot accept
+            raise HTTPException(status_code=400, detail=message) # Generic bad request
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
         logger.exception(f"Error accepting production order {order_id}:")
         raise HTTPException(status_code=500, detail=f"Failed to accept order: {str(e)}")
 
+@app.post("/production/orders/{order_id}/fulfill_accepted_from_stock", response_model=StatusResponse)
+async def fulfill_accepted_order_from_stock_api(order_id: str):
+    sim = get_sim()
+    try:
+        success, message = await sim.fulfill_accepted_order_from_stock(order_id)
+        if success:
+            return StatusResponse(message=message)
+        else:
+            if "insufficient finished product" in message.lower():
+                 raise HTTPException(status_code=409, detail=message)
+            raise HTTPException(status_code=400, detail=message)
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.exception(f"Error fulfilling accepted order {order_id} from stock:")
+        raise HTTPException(status_code=500, detail=f"Failed to fulfill order from stock: {str(e)}")
+
 @app.post("/production/orders/{order_id}/order_missing_materials", response_model=Dict[str, str])
-async def order_missing_materials_for_production_order_api(order_id: str): 
+async def order_missing_materials_for_production_order_api(order_id: str):
     sim = get_sim()
     try:
         results = await sim.place_purchase_order_for_shortages(order_id)
@@ -237,6 +254,10 @@ async def start_production_orders(request: ProductionStartRequest):
     sim = get_sim()
     try:
         results = await sim.start_production(request.order_ids)
+        # Check results for any individual failures to potentially return a mixed status code
+        # For simplicity, if any part of the request leads to an exception not caught by sim.start_production,
+        # it will fall to the generic 500. sim.start_production returns dict of messages.
+        # If all messages indicate issues, it's still a 200 from API but UI shows errors.
         return results
     except Exception as e:
         logger.exception(f"Error starting production for orders {request.order_ids}:")
@@ -271,50 +292,32 @@ async def get_inventory_api(): # Renamed
     sim = get_sim()
     inventory_items: Dict[str, InventoryDetail] = {}
 
-    # Calculate on_order quantities
     on_order_quantities: Dict[str, int] = {}
     pending_pos_raw = await crud.get_items(crud.COLLECTIONS["purchase_orders"], {"status": "Ordered"}, limit=None) # Get all pending
     for po_dict in pending_pos_raw:
         po = PurchaseOrder(**po_dict)
         on_order_quantities[po.material_id] = on_order_quantities.get(po.material_id, 0) + po.quantity_ordered
-    
+
     all_item_ids = set(sim.state.inventory.keys()) | set(sim.state.committed_inventory.keys()) | set(on_order_quantities.keys())
 
-    # Populate details for all known items (materials and products)
-    # This ensures all materials/products defined in the simulation are listed, even if stock is 0.
-    for mat_id, mat_obj in sim.materials.items():
-        all_item_ids.add(mat_id)
-    for prod_id, prod_obj in sim.products.items():
-        all_item_ids.add(prod_id)
-
+    for mat_id, mat_obj in sim.materials.items(): all_item_ids.add(mat_id)
+    for prod_id, prod_obj in sim.products.items(): all_item_ids.add(prod_id)
 
     for item_id in sorted(list(all_item_ids)):
-        item_name = "Unknown Item"
-        item_type = "Unknown"
+        item_name = "Unknown Item"; item_type = "Unknown"
+        if item_id in sim.materials: item_name = sim.materials[item_id].name; item_type = "Material"
+        elif item_id in sim.products: item_name = sim.products[item_id].name; item_type = "Product"
 
-        if item_id in sim.materials:
-            item_name = sim.materials[item_id].name
-            item_type = "Material"
-        elif item_id in sim.products:
-            item_name = sim.products[item_id].name
-            item_type = "Product"
-        
         physical = sim.state.inventory.get(item_id, 0)
-        committed = sim.state.committed_inventory.get(item_id, 0)
-        on_order = on_order_quantities.get(item_id, 0) if item_type == "Material" else 0 # On order only for materials
+        committed = sim.state.committed_inventory.get(item_id, 0) # This is total committed
+        on_order = on_order_quantities.get(item_id, 0) if item_type == "Material" else 0
+        projected_available = physical + on_order - committed # For materials, this includes on_order. For products, physical - committed.
 
-        projected_available = physical + on_order - committed
-        
         inventory_items[item_id] = InventoryDetail(
-            item_id=item_id,
-            name=item_name,
-            type=item_type,
-            physical=physical,
-            committed=committed,
-            on_order=on_order,
+            item_id=item_id, name=item_name, type=item_type,
+            physical=physical, committed=committed, on_order=on_order,
             projected_available=projected_available
         )
-        
     return InventoryStatusResponse(items=inventory_items)
 
 @app.get("/events", response_model=List[SimulationEvent])
@@ -327,7 +330,7 @@ async def export_data():
     try:
         sim_state_raw = await crud.get_item_by_id(crud.COLLECTIONS["simulation_state"], "singleton_state")
         sim_state_dict = sim_state_raw if sim_state_raw else {}
-        sim_state_dict.setdefault('committed_inventory', {}) 
+        sim_state_dict.setdefault('committed_inventory', {})
         sim_state = SimulationState(**sim_state_dict) if sim_state_raw else SimulationState(storage_capacity=0, daily_production_capacity=0, is_initialized=False, committed_inventory={})
 
         events_raw = await crud.get_all_items(crud.COLLECTIONS["events"])
@@ -370,7 +373,7 @@ async def import_data(data: DataExport = Body(...)):
         await crud.import_data_to_collection(crud.COLLECTIONS["materials"], imported_materials)
         await crud.import_data_to_collection(crud.COLLECTIONS["products"], imported_products)
         await crud.import_data_to_collection(crud.COLLECTIONS["providers"], imported_providers)
-        
+
         production_orders_to_import = []
         for p_order_model in data.production_orders:
             p_order_dict = p_order_model.model_dump()
@@ -387,10 +390,11 @@ async def import_data(data: DataExport = Body(...)):
         final_sim_state = SimulationState(**imported_sim_state_dict)
         await crud.save_simulation_state(final_sim_state)
 
-        config = await crud.get_config("random_order_config", {})
+        # Re-fetch config or use one from import if available
+        config = await crud.get_config("random_order_config", {}) # Or data.config if part of DataExport
         current_simulation = FactorySimulation(
              initial_state=final_sim_state,
-             products=data.products, # Pass Pydantic models as expected by FactorySimulation
+             products=data.products,
              materials=data.materials,
              providers=data.providers,
              config=config
@@ -400,8 +404,8 @@ async def import_data(data: DataExport = Body(...)):
         return StatusResponse(message="Data imported successfully.")
     except Exception as e:
         logger.exception("Error during data import:")
-        await database.clear_database() 
-        current_simulation = None 
+        await database.clear_database()
+        current_simulation = None
         raise HTTPException(status_code=500, detail=f"Data import failed: {str(e)}")
 
 @app.get("/", response_model=StatusResponse)
