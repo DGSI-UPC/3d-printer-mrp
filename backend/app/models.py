@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
-from datetime import datetime, date # Keep date for potential other uses if any, but primary change is to datetime
+from datetime import datetime, date 
 
 class Material(BaseModel):
     id: str = Field(..., description="Unique material ID")
@@ -28,7 +28,7 @@ class Provider(BaseModel):
     name: str
     catalogue: List[ProviderOffering]
 
-class InventoryItem(BaseModel):
+class InventoryItem(BaseModel): # This seems like a DTO, might not be actively used by core logic
     item_id: str
     item_type: str
     quantity: int
@@ -38,7 +38,7 @@ class ProductionOrder(BaseModel):
     product_id: str
     quantity: int
     requested_date: datetime
-    status: str = Field("Pending", description="Pending, Accepted, In Progress, Completed, Cancelled")
+    status: str = Field("Pending", description="Pending, Accepted, In Progress, Completed, Cancelled, Fulfilled") # Added Fulfilled
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -103,13 +103,13 @@ class StatusResponse(BaseModel):
 
 class SimulationStatus(BaseModel):
     current_day: int
-    total_inventory_units: int
+    total_inventory_units: int # Physical units for storage calculation
     storage_capacity: int
     storage_utilization: float
     pending_production_orders: int
-    accepted_production_orders: int # New field
+    accepted_production_orders: int
     in_progress_production_orders: int
-    pending_purchase_orders: int
+    pending_purchase_orders: int # Count of POs, not material units
 
 class DataExport(BaseModel):
     simulation_state: SimulationState
@@ -119,3 +119,16 @@ class DataExport(BaseModel):
     products: List[Product]
     providers: List[Provider]
     materials: List[Material]
+
+# New Models for Enhanced Inventory View
+class InventoryDetail(BaseModel):
+    item_id: str # For reference, though dict key will be item_id
+    name: str
+    type: str # "Material" or "Product"
+    physical: int = 0
+    committed: int = 0
+    on_order: int = 0 # Only applicable to materials
+    projected_available: int = 0
+
+class InventoryStatusResponse(BaseModel):
+    items: Dict[str, InventoryDetail] = Field({}, description="Maps item_id to its detailed inventory status")

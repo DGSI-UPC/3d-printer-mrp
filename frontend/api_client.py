@@ -3,14 +3,14 @@ import streamlit as st
 import os
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
-import json # For handling export/import data
+import json 
+from datetime import datetime
 
 load_dotenv()
 
 API_URL = os.getenv("API_URL", "http://backend:8000")
 
 def handle_api_error(response: requests.Response, context: str):
-    """Handles common API errors and displays messages in Streamlit."""
     try:
         detail = response.json().get("detail", "No detail provided.")
     except json.JSONDecodeError:
@@ -24,8 +24,6 @@ def get_simulation_status() -> Optional[Dict]:
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 409: 
-            # This state is now handled more directly in the UI by checking if status is None
-            # st.warning("Simulation not initialized. Please go to 'Setup' to initialize.")
             return None 
         else:
             handle_api_error(response, "fetching simulation status")
@@ -40,7 +38,6 @@ def get_full_simulation_state() -> Optional[Dict]:
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 409:
-             # st.warning("Simulation not initialized.")
              return None
         else:
             handle_api_error(response, "fetching simulation state")
@@ -48,7 +45,6 @@ def get_full_simulation_state() -> Optional[Dict]:
     except requests.exceptions.RequestException as e:
         st.error(f"Network error fetching simulation state: {e}")
         return None
-
 
 def initialize_simulation(initial_data: Dict) -> bool:
     try:
@@ -117,7 +113,6 @@ def get_production_orders(status: Optional[str] = None) -> List[Dict]:
     try:
         response = requests.get(f"{API_URL}/production/orders", params=params)
         if response.status_code == 200:
-            # Ensure required_materials and committed_materials are dicts
             orders = response.json()
             for order in orders:
                 order.setdefault('required_materials', {})
@@ -131,7 +126,6 @@ def get_production_orders(status: Optional[str] = None) -> List[Dict]:
         return []
 
 def accept_production_order(order_id: str) -> bool:
-    """Attempts to accept a production order."""
     try:
         response = requests.post(f"{API_URL}/production/orders/{order_id}/accept")
         if response.status_code == 200:
@@ -145,19 +139,23 @@ def accept_production_order(order_id: str) -> bool:
         return False
 
 def order_missing_materials_for_production_order(order_id: str) -> Optional[Dict]:
-    """Orders missing materials for a specific production order."""
     try:
         response = requests.post(f"{API_URL}/production/orders/{order_id}/order_missing_materials")
         if response.status_code == 200:
             results = response.json()
             st.success(f"Material ordering process for order {order_id} initiated.")
+            all_sufficient = True
             for material_id, message in results.items():
                 if "Ordered" in message:
                     st.info(f"{material_id}: {message}")
+                    all_sufficient = False
                 elif "Sufficient" in message:
-                     st.info(f"{material_id}: {message}")
+                     st.write(f"✔️ {material_id}: {message}") # less prominent for sufficient
                 else:
                     st.warning(f"{material_id}: {message}")
+                    all_sufficient = False # Treat other messages as non-sufficient for summary
+            if all_sufficient and not any("Ordered" in msg for msg in results.values()): # check no orders were placed
+                 st.info("All materials for this order are already sufficiently stocked or on order.")
             return results
         else:
             handle_api_error(response, f"ordering materials for production order {order_id}")
@@ -167,7 +165,6 @@ def order_missing_materials_for_production_order(order_id: str) -> Optional[Dict
         return None
 
 def start_production(order_ids: List[str]) -> Optional[Dict]:
-    """Attempts to start production for 'Accepted' orders."""
     if not order_ids:
         st.warning("No production orders selected to start.")
         return None
@@ -213,16 +210,13 @@ def create_purchase_order(material_id: str, provider_id: str, quantity: int) -> 
         if response.status_code == 201:
             po = response.json()
             arrival_date = po.get('expected_arrival_date')
+            arrival_date_str = "N/A"
             if arrival_date:
                 try:
-                    # Attempt to parse and reformat the date for better readability
-                    parsed_date = datetime.fromisoformat(arrival_date.replace("Z", "+00:00"))
-                    arrival_date_str = parsed_date.strftime('%Y-%m-%d')
-                except ValueError:
-                    arrival_date_str = arrival_date # Fallback to original string if parsing fails
-            else:
-                arrival_date_str = "N/A"
-
+                    parsed_date = datetime.fromisoformat(arrival_date.replace("Z", "+00:00")) if isinstance(arrival_date, str) else datetime.fromtimestamp(arrival_date) if isinstance(arrival_date, (int, float)) else None # Handle different possible date inputs
+                    if parsed_date: arrival_date_str = parsed_date.strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    arrival_date_str = str(arrival_date) 
             st.success(f"Purchase Order {po.get('id')} created successfully. Expected arrival: {arrival_date_str}")
             return True
         else:
@@ -232,19 +226,18 @@ def create_purchase_order(material_id: str, provider_id: str, quantity: int) -> 
         st.error(f"Network error creating purchase order: {e}")
         return False
 
-def get_inventory() -> Optional[Dict[str, Dict[str, int]]]:
+def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for InventoryStatusResponse
     """
-    Fetches inventory data.
-    Returns a dictionary: {"physical": {item_id: qty}, "committed": {item_id: qty}}
+    Fetches detailed inventory status including physical, committed, and on_order quantities.
+    Returns a dictionary like: {"items": {item_id: {"name": ..., "physical": ..., ...}}}
     or None if an error occurs or not initialized.
     """
     try:
         response = requests.get(f"{API_URL}/inventory")
         if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 409: # Simulation not initialized
-            # st.warning("Simulation not initialized. Inventory data unavailable.")
-            return {"physical": {}, "committed": {}} # Return empty structure
+            return response.json() # This will be InventoryStatusResponse model output
+        elif response.status_code == 409: 
+            return {"items": {}} # Return empty structure for items
         else:
             handle_api_error(response, "fetching inventory")
             return None
@@ -283,7 +276,7 @@ def import_data(data: Dict) -> bool:
         response = requests.post(f"{API_URL}/data/import", json=data)
         if response.status_code == 200:
             st.success("Data imported successfully! Refreshing data...")
-            st.rerun() # Trigger a rerun to reflect changes immediately
+            st.rerun() 
             return True
         else:
             handle_api_error(response, "importing data")
