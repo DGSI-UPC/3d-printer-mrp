@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Any
-from datetime import datetime, date # Keep date for potential other uses if any, but primary change is to datetime
+from datetime import datetime, date 
 
 class Material(BaseModel):
     id: str = Field(..., description="Unique material ID")
@@ -28,7 +28,7 @@ class Provider(BaseModel):
     name: str
     catalogue: List[ProviderOffering]
 
-class InventoryItem(BaseModel):
+class InventoryItem(BaseModel): # This seems like a DTO, might not be actively used by core logic
     item_id: str
     item_type: str
     quantity: int
@@ -38,11 +38,12 @@ class ProductionOrder(BaseModel):
     product_id: str
     quantity: int
     requested_date: datetime
-    status: str = Field("Pending", description="Pending, In Progress, Completed, Cancelled")
+    status: str = Field("Pending", description="Pending, Accepted, In Progress, Completed, Cancelled, Fulfilled") # Added Fulfilled
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     required_materials: Dict[str, int] = Field({}, description="Calculated total materials needed")
+    committed_materials: Dict[str, int] = Field({}, description="Materials committed from inventory when order is accepted")
 
 class PurchaseOrder(BaseModel):
     id: str = Field(..., description="Unique purchase order ID")
@@ -66,7 +67,8 @@ class SimulationEvent(BaseModel):
 class SimulationState(BaseModel):
     id: str = Field("singleton_state", description="Unique identifier for the simulation state document")
     current_day: int = 0
-    inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity")
+    inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity (physical stock)")
+    committed_inventory: Dict[str, int] = Field({}, description="Tracks materials committed to accepted orders but not yet consumed by production")
     storage_capacity: int
     daily_production_capacity: int
     active_production_orders: List[str] = Field([], description="List of ProductionOrder IDs currently in progress")
@@ -101,12 +103,13 @@ class StatusResponse(BaseModel):
 
 class SimulationStatus(BaseModel):
     current_day: int
-    total_inventory_units: int
+    total_inventory_units: int # Physical units for storage calculation
     storage_capacity: int
     storage_utilization: float
     pending_production_orders: int
+    accepted_production_orders: int
     in_progress_production_orders: int
-    pending_purchase_orders: int
+    pending_purchase_orders: int # Count of POs, not material units
 
 class DataExport(BaseModel):
     simulation_state: SimulationState
@@ -116,3 +119,16 @@ class DataExport(BaseModel):
     products: List[Product]
     providers: List[Provider]
     materials: List[Material]
+
+# New Models for Enhanced Inventory View
+class InventoryDetail(BaseModel):
+    item_id: str # For reference, though dict key will be item_id
+    name: str
+    type: str # "Material" or "Product"
+    physical: int = 0
+    committed: int = 0
+    on_order: int = 0 # Only applicable to materials
+    projected_available: int = 0
+
+class InventoryStatusResponse(BaseModel):
+    items: Dict[str, InventoryDetail] = Field({}, description="Maps item_id to its detailed inventory status")
