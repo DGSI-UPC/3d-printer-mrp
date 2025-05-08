@@ -38,11 +38,12 @@ class ProductionOrder(BaseModel):
     product_id: str
     quantity: int
     requested_date: datetime
-    status: str = Field("Pending", description="Pending, In Progress, Completed, Cancelled")
+    status: str = Field("Pending", description="Pending, Accepted, In Progress, Completed, Cancelled")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     required_materials: Dict[str, int] = Field({}, description="Calculated total materials needed")
+    committed_materials: Dict[str, int] = Field({}, description="Materials committed from inventory when order is accepted")
 
 class PurchaseOrder(BaseModel):
     id: str = Field(..., description="Unique purchase order ID")
@@ -66,7 +67,8 @@ class SimulationEvent(BaseModel):
 class SimulationState(BaseModel):
     id: str = Field("singleton_state", description="Unique identifier for the simulation state document")
     current_day: int = 0
-    inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity")
+    inventory: Dict[str, int] = Field({}, description="Maps material_id/product_id to quantity (physical stock)")
+    committed_inventory: Dict[str, int] = Field({}, description="Tracks materials committed to accepted orders but not yet consumed by production")
     storage_capacity: int
     daily_production_capacity: int
     active_production_orders: List[str] = Field([], description="List of ProductionOrder IDs currently in progress")
@@ -105,6 +107,7 @@ class SimulationStatus(BaseModel):
     storage_capacity: int
     storage_utilization: float
     pending_production_orders: int
+    accepted_production_orders: int # New field
     in_progress_production_orders: int
     pending_purchase_orders: int
 

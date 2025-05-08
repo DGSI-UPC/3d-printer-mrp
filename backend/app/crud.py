@@ -26,19 +26,24 @@ async def get_item_by_id(collection_name: str, item_id: str, id_field: str = "id
          item['_id'] = str(item['_id'])
     return item
 
-async def get_items(collection_name: str, query: Optional[Dict[str, Any]] = None, limit: int = 100) -> List[dict]:
+async def get_items(collection_name: str, query: Optional[Dict[str, Any]] = None, limit: int = 100, sort_field: Optional[str] = None, sort_order: int = 1) -> List[dict]:
     collection = await get_collection(collection_name)
-    cursor = collection.find(query or {}).limit(limit)
+    cursor = collection.find(query or {})
+    if sort_field:
+        cursor = cursor.sort(sort_field, sort_order)
+    cursor = cursor.limit(limit)
     items = await cursor.to_list(length=limit)
     for item in items:
         if '_id' in item and not isinstance(item['_id'], str):
             item['_id'] = str(item['_id'])
     return items
 
-async def get_all_items(collection_name: str, query: Optional[Dict[str, Any]] = None) -> List[dict]:
+async def get_all_items(collection_name: str, query: Optional[Dict[str, Any]] = None, sort_field: Optional[str] = None, sort_order: int = 1) -> List[dict]:
     """Gets all items matching the query from a collection."""
     collection = await get_collection(collection_name)
     cursor = collection.find(query or {})
+    if sort_field:
+        cursor = cursor.sort(sort_field, sort_order)
     items = await cursor.to_list(length=None) # Use None to get all documents
     for item in items:
         if '_id' in item and not isinstance(item['_id'], str):
@@ -54,7 +59,6 @@ async def update_item(collection_name: str, item_id: str, update_data: dict, id_
 
     if not update_data:
         logger.warning(f"No update data provided for item {item_id} in {collection_name}")
-        # Optionally return the existing item or None/error
         return await get_item_by_id(collection_name, item_id, id_field)
 
 
@@ -73,22 +77,21 @@ async def delete_item(collection_name: str, item_id: str, id_field: str = "id") 
 
 # --- Specific CRUD operations ---
 
-async def get_simulation_state() -> Optional[SimulationState]:
+async def get_simulation_state() -> Optional[dict]: # Return dict to handle missing fields gracefully before Pydantic
     state_dict = await get_item_by_id(COLLECTIONS["simulation_state"], "singleton_state")
-    return SimulationState(**state_dict) if state_dict else None
+    return state_dict
 
 async def save_simulation_state(state: SimulationState) -> SimulationState:
     collection = await get_collection(COLLECTIONS["simulation_state"])
     state_dict = state.model_dump()
-    # Use upsert=True to create the document if it doesn't exist
     await collection.update_one(
         {"id": "singleton_state"},
         {"$set": state_dict},
         upsert=True
     )
-    # Fetch the state again to ensure consistency (optional but good practice)
-    updated_state = await get_simulation_state()
-    return updated_state
+    updated_state_dict = await get_simulation_state()
+    updated_state_dict.setdefault('committed_inventory', {}) # Ensure on refetch
+    return SimulationState(**updated_state_dict)
 
 async def log_event(event: SimulationEvent) -> SimulationEvent:
     event_dict = event.model_dump()
@@ -106,3 +109,24 @@ async def save_config(config_key: str, value: Any):
         {"$set": {"id": config_key, "value": value}},
         upsert=True
     )
+
+async def import_data_to_collection(collection_name: str, data: List[dict]):
+    """Imports data into a collection. Clears existing data before import."""
+    if not data and collection_name != COLLECTIONS["production_orders"]: # Allow empty import for non-essential data if needed
+        # However, for core data like materials, products, if data is empty, it means they are being cleared.
+        # Production orders can be empty.
+        pass # Do not insert if data is empty for some collections
+
+    collection = await get_collection(collection_name)
+    await collection.delete_many({}) # Clear existing data
+    count = 0
+    if data: # Only insert if there's data to insert
+        try:
+            result = await collection.insert_many(data, ordered=False) # ordered=False can speed up, but stops on first error.
+            count = len(result.inserted_ids)
+        except Exception as e:
+            logger.error(f"Error inserting data into {collection_name}: {e}")
+            # Optionally, handle partial inserts or re-raise
+            raise
+    logger.info(f"Imported {count} documents into collection '{collection_name}'.")
+    return count
