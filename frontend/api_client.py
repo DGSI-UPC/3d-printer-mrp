@@ -259,6 +259,30 @@ def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for Inven
         st.error(f"Network error fetching inventory: {e}")
         return None
 
+def get_item_forecast(item_id: str, days: int, historical_lookback_days: int = 0) -> Optional[Dict]:
+    """
+    Fetches the forecasted stock for a given item over a number of days,
+    optionally including a number of historical days (shown as flat line at current stock).
+    """
+    if not item_id: return None
+    try:
+        params = {"days": days, "historical_lookback_days": historical_lookback_days}
+        response = requests.get(f"{API_URL}/inventory/forecast/{item_id}", params=params)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            st.warning(f"Item '{item_id}' not found for forecasting.")
+            return None
+        elif response.status_code == 409: # Simulation not initialized
+            st.warning("Simulation not initialized. Cannot fetch forecast.")
+            return None
+        else:
+            handle_api_error(response, f"fetching forecast for item {item_id}")
+            return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error fetching item forecast: {e}")
+        return None
+
 def get_events(limit: int = 100) -> List[Dict]:
     params = {"limit": limit}
     try:

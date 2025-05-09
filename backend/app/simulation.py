@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone, date
 
 from .models import (
     SimulationState, ProductionOrder, PurchaseOrder, SimulationEvent,
-    Product, Material, Provider, InitialConditions
+    Product, Material, Provider, InitialConditions,
+    ItemForecastResponse, DailyForecast # Added new models
 )
 from . import crud, utils
 
@@ -421,3 +422,196 @@ class FactorySimulation:
         await self.log_sim_event("purchase_order_placed", {"po_id": po.id, "mat_id": material_id, "prov_id": provider_id, "qty": quantity, "eta": expected_arrival_dt.isoformat()})
         logger.info(f"Placed PO {po.id} for {quantity}x {material.name}. ETA: {expected_arrival_dt.isoformat()}")
         return PurchaseOrder(**po_dict)
+
+    async def get_item_forecast(self, item_id: str, num_days: int, historical_lookback_days: int = 0) -> ItemForecastResponse:
+        if item_id in self.materials:
+            item_type = "Material"
+            item_name = self.materials[item_id].name
+        elif item_id in self.products:
+            item_type = "Product"
+            item_name = self.products[item_id].name
+        else:
+            raise ValueError(f"Item ID {item_id} not found as a material or product.")
+
+        current_sim_datetime = SIMULATION_EPOCH_DATETIME + timedelta(days=self.state.current_day)
+        current_sim_date = current_sim_datetime.date()
+        
+        physical_stock = self.state.inventory.get(item_id, 0) # Stock at start of current_day / end of current_day - 1
+        daily_deltas = [0.0] * num_days  # Net change for each day in the forecast period (d_offset 0 to num_days-1)
+
+        forecast_list: List[DailyForecast] = []
+
+        # Historical data points (day_offset from -historical_lookback_days to -1)
+        if historical_lookback_days > 0:
+            for i in range(historical_lookback_days):
+                # day_offset_val goes from -historical_lookback_days, ..., -1
+                day_offset_val = -historical_lookback_days + i 
+                # actual_day_number_eod is the specific past day for which we want the End-Of-Day stock
+                actual_day_number_eod = self.state.current_day + day_offset_val 
+                forecast_dt = current_sim_date + timedelta(days=day_offset_val)
+                
+                qty_for_this_hist_day = 0.0 # Default if no better data found
+
+                if actual_day_number_eod == self.state.current_day - 1:
+                    # For day_offset = -1, the stock is the current physical_stock 
+                    # (which represents stock at the end of day current_day - 1)
+                    qty_for_this_hist_day = float(physical_stock)
+                elif actual_day_number_eod < self.state.current_day - 1:
+                    # For days earlier than current_day - 1, query the last known stock
+                    latest_event_raw = await crud.get_items(
+                        crud.COLLECTIONS["events"],
+                        query={
+                            "event_type": "inventory_change",
+                            "details.item_id": item_id,
+                            "details.inventory_type": "physical", # Ensure physical stock changes
+                            "day": {"$lte": actual_day_number_eod} # Stock at end of this day or any day before it
+                        },
+                        sort_field="timestamp", 
+                        sort_order=-1, # Get the latest one on or before this day
+                        limit=1
+                    )
+                    if latest_event_raw:
+                        qty_for_this_hist_day = float(latest_event_raw[0].get("details",{}).get("new_quantity", 0.0))
+                    # else: qty_for_this_hist_day remains 0.0 if no event ever found for this item prior to this day
+                
+                # For the earliest days in the historical window, if actual_day_number_eod is very early (e.g. < 0),
+                # and no events are found, qty_for_this_hist_day will be 0.0. This is acceptable.
+                forecast_list.append(DailyForecast(day_offset=day_offset_val, date=forecast_dt, quantity=qty_for_this_hist_day))
+
+        # Calculate future daily deltas (same logic as before for item_type Material or Product)
+        if item_type == "Material":
+            # Incoming materials from Purchase Orders
+            pending_pos_dicts = await crud.get_items(
+                crud.COLLECTIONS["purchase_orders"],
+                {"status": "Ordered", "material_id": item_id},
+                limit=None # Get all relevant POs
+            )
+            for po_dict in pending_pos_dicts:
+                po = PurchaseOrder(**po_dict)
+                arrival_offset = (po.expected_arrival_date.date() - current_sim_date).days
+                if 0 <= arrival_offset < num_days:
+                    daily_deltas[arrival_offset] += po.quantity_ordered
+            
+            # Outgoing materials for Production Orders
+            # Considers materials committed and consumed during their production cycle.
+            # This includes orders currently "In Progress" and potentially "Accepted" orders
+            # if we were to forecast their start and subsequent material consumption.
+            # For now, focusing on "In Progress" as their start_at is set.
+            # Accepted orders' material impact is immediate on physical stock (committed),
+            # but not on future consumption from physical unless they start production.
+            # The current logic for "Accepted" orders in product forecast is for product output, not material input.
+
+            production_orders_consuming_material = await crud.get_items(
+                crud.COLLECTIONS["production_orders"],
+                # We are interested in orders that will consume this material.
+                # Primarily "In Progress". "Accepted" orders have materials already moved from physical to committed.
+                # The forecast should reflect future *physical* stock changes.
+                # So, consumption happens when production *actually* uses it, which is during "In Progress".
+                {"status": "In Progress"}, 
+                limit=None
+            )
+
+            for prod_o_dict in production_orders_consuming_material:
+                prod_o = ProductionOrder(**prod_o_dict)
+                product_def = self.products.get(prod_o.product_id)
+
+                if not product_def or not prod_o.started_at:
+                    continue
+
+                total_material_needed_for_order = prod_o.committed_materials.get(item_id, 0)
+                if total_material_needed_for_order == 0:
+                    continue
+
+                prod_o_started_at_date = prod_o.started_at.date()
+                production_duration_days = product_def.production_time
+                
+                # Calculate the offset of the production order's start date from the forecast's start date
+                base_start_offset_from_forecast_start = (prod_o_started_at_date - current_sim_date).days
+
+                if production_duration_days <= 0: # Should not happen with valid data
+                    production_duration_days = 1 
+
+                if production_duration_days == 1:
+                    # All consumption happens on the start day of production
+                    consumption_forecast_offset = base_start_offset_from_forecast_start
+                    if 0 <= consumption_forecast_offset < num_days:
+                        daily_deltas[consumption_forecast_offset] -= total_material_needed_for_order
+                else:
+                    # Multi-day production cycle
+                    if total_material_needed_for_order == 1:
+                        # Single unit consumed in the middle of the production cycle
+                        middle_day_of_production_cycle = (production_duration_days - 1) // 2 # 0-indexed
+                        consumption_forecast_offset = base_start_offset_from_forecast_start + middle_day_of_production_cycle
+                        if 0 <= consumption_forecast_offset < num_days:
+                            daily_deltas[consumption_forecast_offset] -= 1.0
+                    else:
+                        # Multiple units distributed equitably across the production cycle
+                        # daily_consumption_schedule maps day_in_cycle to quantity consumed on that day
+                        daily_consumption_schedule = [0.0] * production_duration_days
+                        for i in range(int(total_material_needed_for_order)): # Ensure integer for loop
+                            day_index_in_cycle = i % production_duration_days
+                            daily_consumption_schedule[day_index_in_cycle] += 1.0
+                        
+                        for day_in_cycle_idx, qty_consumed_on_cycle_day in enumerate(daily_consumption_schedule):
+                            if qty_consumed_on_cycle_day > 0:
+                                consumption_forecast_offset = base_start_offset_from_forecast_start + day_in_cycle_idx
+                                if 0 <= consumption_forecast_offset < num_days:
+                                    daily_deltas[consumption_forecast_offset] -= qty_consumed_on_cycle_day
+        
+        elif item_type == "Product":
+            # Contributions from in-progress production orders
+            in_progress_orders_dicts = await crud.get_items(
+                crud.COLLECTIONS["production_orders"],
+                {"status": "In Progress", "product_id": item_id},
+                limit=None
+            )
+            for prod_o_dict in in_progress_orders_dicts:
+                prod_o = ProductionOrder(**prod_o_dict)
+                product_def = self.products.get(prod_o.product_id)
+                if product_def and prod_o.started_at:
+                    # Ensure started_at is timezone-aware or naive consistent with current_sim_date
+                    started_at_date = prod_o.started_at.date()
+                    completion_date = started_at_date + timedelta(days=product_def.production_time)
+                    completion_offset = (completion_date - current_sim_date).days
+                    if 0 <= completion_offset < num_days:
+                        daily_deltas[completion_offset] += prod_o.quantity
+
+            # Demand from accepted orders (fulfilled from stock)
+            # This assumes fulfillment happens on day 0 of the forecast period if stock allows.
+            accepted_orders_dicts = await crud.get_items(
+                crud.COLLECTIONS["production_orders"],
+                {"status": "Accepted", "product_id": item_id},
+                limit=None,
+                sort_field="requested_date", # Prioritize older requests
+                sort_order=1 
+            )
+            
+            # Simulate fulfillment of accepted orders from stock for the forecast
+            simulated_physical_for_fulfillment = float(physical_stock) # Start with current physical
+            # Adjust simulated_physical_for_fulfillment based on production completions on day 0
+            # This part can get complex if production on day 0 also feeds into this.
+            # For simplicity, let's assume day 0 production output is not available for day 0 accepted order fulfillment.
+            # Or, more simply, assume daily_deltas[0] for production is already accounted if it happens before fulfillment.
+            # Let's keep it simple: use initial physical_stock for this check.
+
+            for acc_o_dict in accepted_orders_dicts:
+                acc_o = ProductionOrder(**acc_o_dict)
+                if simulated_physical_for_fulfillment >= acc_o.quantity:
+                    daily_deltas[0] -= acc_o.quantity  # Demand on day 0
+                    simulated_physical_for_fulfillment -= acc_o.quantity
+        
+        # Projected future points (day_offset from 0 to num_days-1)
+        running_balance = float(physical_stock) # Initialize with stock at start of current day (end of day_offset -1)
+        for d_offset in range(num_days): # d_offset = 0, 1, ..., num_days-1
+            running_balance += daily_deltas[d_offset] # Add net change for the current forecast day
+            forecast_dt = current_sim_date + timedelta(days=d_offset)
+            forecast_list.append(
+                DailyForecast(day_offset=d_offset, date=forecast_dt, quantity=running_balance)
+            )
+            
+        return ItemForecastResponse(
+            item_id=item_id,
+            item_name=item_name,
+            item_type=item_type,
+            forecast=forecast_list
+        )

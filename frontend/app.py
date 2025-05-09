@@ -11,7 +11,7 @@ from api_client import (
     fulfill_accepted_production_order_from_stock, # New import
     order_missing_materials_for_production_order,
     get_purchase_orders, create_purchase_order,
-    get_events, export_data, import_data
+    get_events, export_data, import_data, get_item_forecast # Added get_item_forecast
 )
 
 st.set_page_config(
@@ -31,6 +31,10 @@ def load_base_data():
 @st.cache_data(ttl=10)
 def load_inventory_data_cached():
     return get_inventory()
+
+@st.cache_data(ttl=10) # Cache forecast calls
+def load_item_forecast_cached(item_id: str, days: int, historical_lookback_days: int = 0):
+    return get_item_forecast(item_id, days, historical_lookback_days)
 
 def format_bom(bom_list, materials_dict_local, header=""):
     if not bom_list: return f"{header}No BOM defined" if header else "No BOM defined"
@@ -404,6 +408,126 @@ elif page == "Inventory":
                  else: st.info(f"No items with non-zero {chart_sel} data to display.")
             else: st.info("Inventory is currently empty.")
         else: st.info("Could not retrieve inventory data or inventory is empty.")
+
+        st.divider()
+        st.subheader("📈 Item Stock Forecast")
+        
+        # Prepare item list for dropdown (materials and products)
+        all_items_for_select = []
+        if materials_list_data:
+            all_items_for_select.extend([
+                {"id": m['id'], "name": f"{m['name']} (Material)", "type": "Material"} for m in materials_list_data
+            ])
+        if products_list_data:
+            all_items_for_select.extend([
+                {"id": p['id'], "name": f"{p['name']} (Product)", "type": "Product"} for p in products_list_data
+            ])
+        
+        if not all_items_for_select:
+            st.info("No materials or products defined to generate a forecast.")
+        else:
+            sorted_items_for_select = sorted(all_items_for_select, key=lambda x: x['name'])
+            
+            col_item_select, col_days_select = st.columns(2)
+            selected_item_id = col_item_select.selectbox(
+                "Select Item for Forecast:",
+                options=[item['id'] for item in sorted_items_for_select],
+                format_func=lambda item_id: next((item['name'] for item in sorted_items_for_select if item['id'] == item_id), "Unknown Item"),
+                index=0 if sorted_items_for_select else None,
+                key="forecast_item_select"
+            )
+            
+            forecast_days_options = [7, 14, 30]
+            selected_forecast_days = col_days_select.selectbox(
+                "Select Forecast Horizon (days):",
+                options=forecast_days_options,
+                index=0,
+                key="forecast_days_select"
+            )
+
+            if selected_item_id and selected_forecast_days:
+                # Let's add a fixed historical lookback for visual context
+                # historical_days_to_show = 3 # Old fixed value
+                if selected_forecast_days == 7:
+                    historical_days_to_show = 3
+                elif selected_forecast_days == 14:
+                    historical_days_to_show = 5
+                elif selected_forecast_days == 30:
+                    historical_days_to_show = 10
+                else: # Default for any other selection
+                    historical_days_to_show = 3
+
+                forecast_data_response = load_item_forecast_cached(selected_item_id, selected_forecast_days, historical_days_to_show)
+                
+                if forecast_data_response and 'forecast' in forecast_data_response and forecast_data_response['forecast']:
+                    forecast_df = pd.DataFrame(forecast_data_response['forecast'])
+                    forecast_df['date'] = pd.to_datetime(forecast_df['date']) # Ensure date is datetime type
+                    forecast_df = forecast_df.sort_values(by='date') # Ensure data is sorted by date
+
+                    item_display_name = forecast_data_response.get('item_name', selected_item_id)
+                    
+                    # Find the current date (where day_offset is 0)
+                    current_day_data = forecast_df[forecast_df['day_offset'] == 0]
+                    current_date_vline = current_day_data['date'].iloc[0] if not current_day_data.empty else None
+
+                    # Create the figure
+                    fig_forecast = px.line(title=f"Projected Stock for '{item_display_name}'")
+
+                    # Split data for different colors
+                    past_and_current_df = forecast_df[forecast_df['day_offset'] <= 0]
+                    current_and_future_df = forecast_df[forecast_df['day_offset'] >= 0]
+
+                    if not past_and_current_df.empty:
+                        fig_forecast.add_trace(
+                            px.line(past_and_current_df, x='date', y='quantity').data[0].update(
+                                line=dict(color='royalblue', dash='dash'), name='Historical Context / Current'
+                            )
+                        )
+                    
+                    if not current_and_future_df.empty:
+                        # Ensure the "future" trace starts from the current day to connect smoothly
+                        fig_forecast.add_trace(
+                            px.line(current_and_future_df, x='date', y='quantity').data[0].update(
+                                line=dict(color='darkorange'), name='Forecast'
+                            )
+                        )
+                    
+                    # Add a vertical line for the current day
+                    if current_date_vline:
+                        fig_forecast.add_vline(
+                            x=current_date_vline, 
+                            line_width=2, 
+                            line_dash="solid", 
+                            line_color="green"
+                        )
+                        # Add annotation separately to avoid the sum() error with Timestamps
+                        fig_forecast.add_annotation(
+                            x=current_date_vline,
+                            y=1.03, # Position slightly above the top of the plot
+                            yref="paper", # Y coordinate is relative to the paper viewport
+                            text="Current Day",
+                            showarrow=False,
+                            font=dict(
+                                color="green",
+                                size=12
+                            ),
+                            xanchor="center", # Anchor the text's center to the vline
+                            yanchor="bottom"  # Anchor the text's bottom
+                        )
+                    
+                    fig_forecast.update_layout(
+                        xaxis_title='Date', 
+                        yaxis_title='Projected Quantity',
+                        legend_title_text='Legend'
+                    )
+                    fig_forecast.update_traces(mode='lines+markers')
+                    st.plotly_chart(fig_forecast, use_container_width=True)
+                elif forecast_data_response is None and st.session_state.simulation_status: # API call failed but sim is running
+                    st.warning(f"Could not retrieve forecast data for item ID '{selected_item_id}'. The item might not exist or an error occurred.")
+                elif not st.session_state.simulation_status:
+                     st.info("Simulation not initialized. Forecast unavailable.")
+                else: # No data returned, or empty forecast list
+                    st.info(f"No forecast data available for '{selected_item_id}' for the selected period.")
 
 
 elif page == "History":

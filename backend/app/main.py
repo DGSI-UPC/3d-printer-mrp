@@ -9,7 +9,7 @@ from .models import (
     Material, Product, Provider, ProductionOrder, PurchaseOrder, SimulationEvent,
     SimulationState, InitialConditions, ProductionStartRequest, PurchaseOrderRequest,
     StatusResponse, SimulationStatus, DataExport,
-    InventoryStatusResponse, InventoryDetail # Added new inventory models
+    InventoryStatusResponse, InventoryDetail, ItemForecastResponse # Added ItemForecastResponse
 )
 from .simulation import FactorySimulation
 
@@ -319,6 +319,29 @@ async def get_inventory_api(): # Renamed
             projected_available=projected_available
         )
     return InventoryStatusResponse(items=inventory_items)
+
+@app.get("/inventory/forecast/{item_id}", response_model=ItemForecastResponse)
+async def get_item_forecast_api(
+    item_id: str, 
+    days: int = Query(7, ge=1, le=90),
+    historical_lookback_days: int = Query(0, ge=0, le=30, description="Number of past days to include for historical context")
+):
+    sim = get_sim()
+    try:
+        # Check if item_id is valid first to provide a clear 404 if not found
+        if not (item_id in sim.materials or item_id in sim.products):
+            raise HTTPException(status_code=404, detail=f"Item with ID '{item_id}' not found as a material or product.")
+        
+        forecast_data = await sim.get_item_forecast(item_id, days, historical_lookback_days)
+        return forecast_data
+    except ValueError as ve: # Catch specific errors from simulation logic if needed
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException as http_exc:
+        raise http_exc # Re-raise existing HTTPExceptions
+    except Exception as e:
+        logger.exception(f"Error generating forecast for item {item_id}:")
+        raise HTTPException(status_code=500, detail=f"Failed to generate forecast: {str(e)}")
+
 
 @app.get("/events", response_model=List[SimulationEvent])
 async def list_events(limit: int = Query(100, description="Maximum number of events to return")):
