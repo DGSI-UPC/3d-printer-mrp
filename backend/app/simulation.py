@@ -423,7 +423,7 @@ class FactorySimulation:
         logger.info(f"Placed PO {po.id} for {quantity}x {material.name}. ETA: {expected_arrival_dt.isoformat()}")
         return PurchaseOrder(**po_dict)
 
-    async def get_item_forecast(self, item_id: str, num_days: int) -> ItemForecastResponse:
+    async def get_item_forecast(self, item_id: str, num_days: int, historical_lookback_days: int = 0) -> ItemForecastResponse:
         if item_id in self.materials:
             item_type = "Material"
             item_name = self.materials[item_id].name
@@ -431,17 +431,54 @@ class FactorySimulation:
             item_type = "Product"
             item_name = self.products[item_id].name
         else:
-            # This case should ideally be caught by the API layer returning a 404
-            # if the item_id doesn't resolve to a known material or product.
-            # For robustness within the simulation, we raise ValueError.
             raise ValueError(f"Item ID {item_id} not found as a material or product.")
 
         current_sim_datetime = SIMULATION_EPOCH_DATETIME + timedelta(days=self.state.current_day)
         current_sim_date = current_sim_datetime.date()
         
-        physical_stock = self.state.inventory.get(item_id, 0)
-        daily_deltas = [0.0] * num_days  # Net change for each day in the forecast period
+        physical_stock = self.state.inventory.get(item_id, 0) # Stock at start of current_day / end of current_day - 1
+        daily_deltas = [0.0] * num_days  # Net change for each day in the forecast period (d_offset 0 to num_days-1)
 
+        forecast_list: List[DailyForecast] = []
+
+        # Historical data points (day_offset from -historical_lookback_days to -1)
+        if historical_lookback_days > 0:
+            for i in range(historical_lookback_days):
+                # day_offset_val goes from -historical_lookback_days, ..., -1
+                day_offset_val = -historical_lookback_days + i 
+                # actual_day_number_eod is the specific past day for which we want the End-Of-Day stock
+                actual_day_number_eod = self.state.current_day + day_offset_val 
+                forecast_dt = current_sim_date + timedelta(days=day_offset_val)
+                
+                qty_for_this_hist_day = 0.0 # Default if no better data found
+
+                if actual_day_number_eod == self.state.current_day - 1:
+                    # For day_offset = -1, the stock is the current physical_stock 
+                    # (which represents stock at the end of day current_day - 1)
+                    qty_for_this_hist_day = float(physical_stock)
+                elif actual_day_number_eod < self.state.current_day - 1:
+                    # For days earlier than current_day - 1, query the last known stock
+                    latest_event_raw = await crud.get_items(
+                        crud.COLLECTIONS["events"],
+                        query={
+                            "event_type": "inventory_change",
+                            "details.item_id": item_id,
+                            "details.inventory_type": "physical", # Ensure physical stock changes
+                            "day": {"$lte": actual_day_number_eod} # Stock at end of this day or any day before it
+                        },
+                        sort_field="timestamp", 
+                        sort_order=-1, # Get the latest one on or before this day
+                        limit=1
+                    )
+                    if latest_event_raw:
+                        qty_for_this_hist_day = float(latest_event_raw[0].get("details",{}).get("new_quantity", 0.0))
+                    # else: qty_for_this_hist_day remains 0.0 if no event ever found for this item prior to this day
+                
+                # For the earliest days in the historical window, if actual_day_number_eod is very early (e.g. < 0),
+                # and no events are found, qty_for_this_hist_day will be 0.0. This is acceptable.
+                forecast_list.append(DailyForecast(day_offset=day_offset_val, date=forecast_dt, quantity=qty_for_this_hist_day))
+
+        # Calculate future daily deltas (same logic as before for item_type Material or Product)
         if item_type == "Material":
             # Incoming materials from Purchase Orders
             pending_pos_dicts = await crud.get_items(
@@ -563,13 +600,13 @@ class FactorySimulation:
                     daily_deltas[0] -= acc_o.quantity  # Demand on day 0
                     simulated_physical_for_fulfillment -= acc_o.quantity
         
-        forecast_list: List[DailyForecast] = []
-        running_balance = float(physical_stock)
-        for d_offset in range(num_days):
-            running_balance += daily_deltas[d_offset]
-            forecast_date = current_sim_date + timedelta(days=d_offset)
+        # Projected future points (day_offset from 0 to num_days-1)
+        running_balance = float(physical_stock) # Initialize with stock at start of current day (end of day_offset -1)
+        for d_offset in range(num_days): # d_offset = 0, 1, ..., num_days-1
+            running_balance += daily_deltas[d_offset] # Add net change for the current forecast day
+            forecast_dt = current_sim_date + timedelta(days=d_offset)
             forecast_list.append(
-                DailyForecast(day_offset=d_offset, date=forecast_date, quantity=running_balance)
+                DailyForecast(day_offset=d_offset, date=forecast_dt, quantity=running_balance)
             )
             
         return ItemForecastResponse(

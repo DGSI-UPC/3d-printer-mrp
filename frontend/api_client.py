@@ -259,13 +259,15 @@ def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for Inven
         st.error(f"Network error fetching inventory: {e}")
         return None
 
-def get_item_forecast(item_id: str, days: int) -> Optional[Dict]:
+def get_item_forecast(item_id: str, days: int, historical_lookback_days: int = 0) -> Optional[Dict]:
     """
-    Fetches the forecasted stock for a given item over a number of days.
+    Fetches the forecasted stock for a given item over a number of days,
+    optionally including a number of historical days (shown as flat line at current stock).
     """
     if not item_id: return None
     try:
-        response = requests.get(f"{API_URL}/inventory/forecast/{item_id}", params={"days": days})
+        params = {"days": days, "historical_lookback_days": historical_lookback_days}
+        response = requests.get(f"{API_URL}/inventory/forecast/{item_id}", params=params)
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 404:
