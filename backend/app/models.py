@@ -132,3 +132,15 @@ class InventoryDetail(BaseModel):
 
 class InventoryStatusResponse(BaseModel):
     items: Dict[str, InventoryDetail] = Field({}, description="Maps item_id to its detailed inventory status")
+
+# New Models for Item Forecast
+class DailyForecast(BaseModel):
+    day_offset: int  # 0 for current day's end / next day's start, 1 for day after, etc.
+    date: date
+    quantity: float
+
+class ItemForecastResponse(BaseModel):
+    item_id: str
+    item_name: str
+    item_type: str # "Material" or "Product"
+    forecast: List[DailyForecast]
