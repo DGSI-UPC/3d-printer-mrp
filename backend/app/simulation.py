@@ -306,12 +306,12 @@ class FactorySimulation:
                     if completed_production_today < self.state.daily_production_capacity:
                         if order.committed_materials:
                             for mat_id, qty_consumed in order.committed_materials.items():
-                                await self.update_inventory(mat_id, -qty_consumed, is_physical=False)
-                        await self.update_inventory(order.product_id, order.quantity, is_physical=True)
-
+                                await self.update_inventory(mat_id, -qty_consumed, is_physical=False) # Consume committed materials
+                        
                         order.status = "Completed"; order.completed_at = current_sim_processing_datetime
                         await crud.update_item(crud.COLLECTIONS["production_orders"], order.id, order.model_dump(exclude_none=True, include={"status", "completed_at"}))
-                        if order_id in self.state.active_production_orders: self.state.active_production_orders.remove(order_id)
+                        if order_id in self.state.active_production_orders:
+                            self.state.active_production_orders.remove(order_id)
                         await self.log_sim_event("production_completed", {"order_id":order.id, "prod_id":order.product_id, "qty":order.quantity})
                         completed_production_today += 1
                     else:
