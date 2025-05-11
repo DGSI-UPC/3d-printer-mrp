@@ -44,6 +44,7 @@ A web application simulating the Material Requirements Planning (MRP) and financ
 
 ## Project Structure
 
+```
 mrp-simulation/
 ├── backend/        # FastAPI application, simulation logic, DB interaction
 │   ├── app/
@@ -65,6 +66,7 @@ mrp-simulation/
 ├── data/           # Example initial data (if any, currently defaults are in frontend)
 ├── docker-compose.yml # Docker Compose configuration
 └── README.md       # This file
+```
 
 ## Setup & Running
 
