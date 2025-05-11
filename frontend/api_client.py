@@ -15,7 +15,13 @@ def handle_api_error(response: requests.Response, context: str):
         detail = response.json().get("detail", "No detail provided.")
     except json.JSONDecodeError:
         detail = response.text
-    st.error(f"API Error in {context}: {response.status_code} - {detail}")
+    
+    if response.status_code == 402: # Payment Required
+        st.error(f"Financial Error in {context}: {response.status_code} - {detail}")
+    elif response.status_code == 409 and "Simulation not initialized" in detail: # Specific handling for 409 not initialized
+        st.warning(f"{detail} (Info from: {context})") # Less alarming for "not initialized"
+    else:
+        st.error(f"API Error in {context}: {response.status_code} - {detail}")
     return None
 
 def get_simulation_status() -> Optional[Dict]:
@@ -23,8 +29,10 @@ def get_simulation_status() -> Optional[Dict]:
         response = requests.get(f"{API_URL}/simulation/status")
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 409:
-            return None
+        # Simulation not initialized is a common case, handle less like an "error"
+        elif response.status_code == 409 and response.json().get("detail", "").startswith("Simulation not initialized"):
+            # st.info("Simulation not initialized yet. Go to 'Setup & Data'. (From: fetching simulation status)")
+            return None # Return None, page will handle message
         else:
             handle_api_error(response, "fetching simulation status")
             return None
@@ -37,7 +45,8 @@ def get_full_simulation_state() -> Optional[Dict]:
         response = requests.get(f"{API_URL}/simulation/state")
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 409:
+        elif response.status_code == 409 and response.json().get("detail", "").startswith("Simulation not initialized"):
+             # st.info("Simulation not initialized. (From: fetching simulation state)")
              return None
         else:
             handle_api_error(response, "fetching simulation state")
@@ -63,7 +72,7 @@ def advance_day() -> Optional[Dict]:
     try:
         response = requests.post(f"{API_URL}/simulation/advance_day")
         if response.status_code == 200:
-            st.success(f"Advanced to Day {response.json().get('current_day')}.")
+            st.success(f"Advanced to Day {response.json().get('current_day')}. Balance: {response.json().get('current_balance', 0.0):.2f} EUR")
             return response.json()
         else:
             handle_api_error(response, "advancing simulation day")
@@ -117,6 +126,7 @@ def get_production_orders(status: Optional[str] = None) -> List[Dict]:
             for order in orders:
                 order.setdefault('required_materials', {})
                 order.setdefault('committed_materials', {})
+                order.setdefault('revenue_collected', False)
             return orders
         else:
             handle_api_error(response, f"fetching production orders (status: {status})")
@@ -157,20 +167,27 @@ def order_missing_materials_for_production_order(order_id: str) -> Optional[Dict
         if response.status_code == 200:
             results = response.json()
             st.success(f"Material ordering process for order {order_id} initiated.")
-            all_sufficient = True
+            all_sufficient_or_ordered = True
+            contains_error_msg = False
             for material_id, message in results.items():
                 if "Ordered" in message:
-                    st.info(f"{material_id}: {message}")
-                    all_sufficient = False
-                elif "Sufficient" in message:
-                     st.write(f"✔️ {material_id}: {message}") # less prominent for sufficient
-                else:
-                    st.warning(f"{material_id}: {message}")
-                    all_sufficient = False # Treat other messages as non-sufficient for summary
-            if all_sufficient and not any("Ordered" in msg for msg in results.values()): # check no orders were placed
-                 st.info("All materials for this order are already sufficiently stocked or on order.")
+                    st.info(f"🧾 {material_id}: {message}")
+                elif "Sufficient" in message or "No additional sourcing needed" in message :
+                     st.write(f"✔️ {material_id}: {message}")
+                elif "Error placing PO" in message or "Insufficient funds" in message: # Specific check for PO error
+                    st.error(f"⚠️ {material_id}: {message}") # Use error for this
+                    all_sufficient_or_ordered = False
+                    contains_error_msg = True
+                else: # Other warnings or non-critical messages
+                    st.warning(f"ℹ️ {material_id}: {message}")
+                    all_sufficient_or_ordered = False # Treat other messages as needing attention
+
+            if all_sufficient_or_ordered and not any("Ordered" in msg for msg in results.values()) and not contains_error_msg:
+                 st.info("All materials for this order are already sufficiently stocked or covered.")
+            elif not all_sufficient_or_ordered and not any("Ordered" in msg for msg in results.values()) and not contains_error_msg :
+                st.warning("Review material status; some items may need attention or alternative sourcing.")
             return results
-        else:
+        else: # Handles non-200 responses, including 402 from the endpoint itself
             handle_api_error(response, f"ordering materials for production order {order_id}")
             return None
     except requests.exceptions.RequestException as e:
@@ -226,32 +243,28 @@ def create_purchase_order(material_id: str, provider_id: str, quantity: int) -> 
             arrival_date_str = "N/A"
             if arrival_date:
                 try:
-                    # Handle different possible date inputs (ISO string, timestamp)
                     parsed_date = datetime.fromisoformat(arrival_date.replace("Z", "+00:00")) if isinstance(arrival_date, str) else datetime.fromtimestamp(arrival_date) if isinstance(arrival_date, (int, float)) else None
                     if parsed_date: arrival_date_str = parsed_date.strftime('%Y-%m-%d')
                 except (ValueError, TypeError):
                     arrival_date_str = str(arrival_date)
-            st.success(f"Purchase Order {po.get('id')} created successfully. Expected arrival: {arrival_date_str}")
+            
+            total_cost_str = f"{po.get('total_cost', 0.0):.2f} EUR" if po.get('total_cost') is not None else "N/A"
+            st.success(f"Purchase Order {po.get('id')} created. Cost: {total_cost_str}. Expected arrival: {arrival_date_str}")
             return True
-        else:
+        else: # Handles non-201, including 402 from the endpoint
             handle_api_error(response, "creating purchase order")
             return False
     except requests.exceptions.RequestException as e:
         st.error(f"Network error creating purchase order: {e}")
         return False
 
-def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for InventoryStatusResponse
-    """
-    Fetches detailed inventory status including physical, committed, and on_order quantities.
-    Returns a dictionary like: {"items": {item_id: {"name": ..., "physical": ..., ...}}}
-    or None if an error occurs or not initialized.
-    """
+def get_inventory() -> Optional[Dict[str, Any]]:
     try:
         response = requests.get(f"{API_URL}/inventory")
         if response.status_code == 200:
-            return response.json() # This will be InventoryStatusResponse model output
-        elif response.status_code == 409:
-            return {"items": {}} # Return empty structure for items
+            return response.json()
+        elif response.status_code == 409 and response.json().get("detail","").startswith("Simulation not initialized"):
+            return {"items": {}} 
         else:
             handle_api_error(response, "fetching inventory")
             return None
@@ -260,10 +273,6 @@ def get_inventory() -> Optional[Dict[str, Any]]: # Changed return type for Inven
         return None
 
 def get_item_forecast(item_id: str, days: int, historical_lookback_days: int = 0) -> Optional[Dict]:
-    """
-    Fetches the forecasted stock for a given item over a number of days,
-    optionally including a number of historical days (shown as flat line at current stock).
-    """
     if not item_id: return None
     try:
         params = {"days": days, "historical_lookback_days": historical_lookback_days}
@@ -273,7 +282,7 @@ def get_item_forecast(item_id: str, days: int, historical_lookback_days: int = 0
         elif response.status_code == 404:
             st.warning(f"Item '{item_id}' not found for forecasting.")
             return None
-        elif response.status_code == 409: # Simulation not initialized
+        elif response.status_code == 409 and response.json().get("detail","").startswith("Simulation not initialized"):
             st.warning("Simulation not initialized. Cannot fetch forecast.")
             return None
         else:
@@ -314,7 +323,7 @@ def import_data(data: Dict) -> bool:
         response = requests.post(f"{API_URL}/data/import", json=data)
         if response.status_code == 200:
             st.success("Data imported successfully! Refreshing data...")
-            st.rerun()
+            # st.rerun() # Re-run should be handled by the calling page if needed
             return True
         else:
             handle_api_error(response, "importing data")
@@ -322,3 +331,24 @@ def import_data(data: Dict) -> bool:
     except requests.exceptions.RequestException as e:
         st.error(f"Network error importing data: {e}")
         return False
+
+# --- New function for Finances Page ---
+def get_financial_data(forecast_days: int = 7) -> Optional[Dict]:
+    """
+    Fetches financial summary, historical performance, and forecast.
+    Returns a dictionary corresponding to the FinancialPageData model.
+    """
+    try:
+        params = {"forecast_days": forecast_days}
+        response = requests.get(f"{API_URL}/finances", params=params)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 409 and response.json().get("detail","").startswith("Simulation not initialized"):
+            st.warning("Simulation not initialized. Cannot fetch financial data.")
+            return None
+        else:
+            handle_api_error(response, "fetching financial data")
+            return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error fetching financial data: {e}")
+        return None
