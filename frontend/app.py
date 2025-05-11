@@ -398,34 +398,75 @@ elif page == "Production":
 
 elif page == "Purchasing":
     st.header("🛒 Material Purchasing")
-    if not st.session_state.simulation_status: st.warning("Simulation not initialized.")
-    elif not materials_list_data or not providers_list_data: st.warning("No materials or providers defined.")
+    if not st.session_state.simulation_status:
+        st.warning("Simulation not initialized.")
+    elif not materials_list_data or not providers_list_data:
+        st.warning("No materials or providers defined.")
     else:
         col1, col2 = st.columns([2, 1])
         with col1:
             st.subheader("Create Purchase Order")
+            # build material options and select outside form
+            mat_opts = {m['id']: f"{m['name']} (ID: {m['id']})" for m in materials_list_data}
+            sel_mat_id = st.selectbox(
+                "Material",
+                options=list(mat_opts.keys()),
+                format_func=lambda x: mat_opts[x],
+                key="po_selected_material"
+            )
+            # reset provider+quantity if material changed
+            if st.session_state.get("po_selected_material_prev") != sel_mat_id:
+                st.session_state.pop("po_selected_provider", None)
+                st.session_state.pop("po_selected_quantity", None)
+                st.session_state["po_selected_material_prev"] = sel_mat_id
+
             with st.form("purchase_order_form"):
-                mat_opts = {m['id']: f"{m['name']} (ID: {m['id']})" for m in materials_list_data}
-                sel_mat_id = st.selectbox("Material", options=list(mat_opts.keys()), format_func=lambda x: mat_opts[x])
-                avail_provs = [p for p_id, p in providers_dict.items() if any(o['material_id'] == sel_mat_id for o in p.get('catalogue',[]))] if sel_mat_id else []
+                avail_provs = [
+                    p for p in providers_dict.values()
+                    if any(o['material_id'] == sel_mat_id for o in p.get('catalogue', []))
+                ] if sel_mat_id else []
 
                 if not avail_provs:
-                    st.warning(f"No provider offers: {materials_dict.get(sel_mat_id,{}).get('name', sel_mat_id)}")
-                    sel_prov_id = None; st.selectbox("Provider", [], disabled=True); st.number_input("Qty", 1,1,1,disabled=True); submit_dis = True
+                    st.warning(f"No provider offers: {materials_dict.get(sel_mat_id, {}).get('name', sel_mat_id)}")
+                    sel_prov_id = None
+                    st.selectbox(
+                        "Provider", options=[], disabled=True,
+                        key="po_selected_provider"
+                    )
+                    qty_val = st.number_input(
+                        "Quantity (units)", 1, 1, 1,
+                        key="po_selected_quantity", disabled=True
+                    )
+                    submit_disabled = True
                 else:
                     prov_opts = {p['id']: f"{p['name']} (ID: {p['id']})" for p in avail_provs}
-                    sel_prov_id = st.selectbox("Provider", options=list(prov_opts.keys()), format_func=lambda x: prov_opts[x])
+                    sel_prov_id = st.selectbox(
+                        "Provider",
+                        options=list(prov_opts.keys()),
+                        format_func=lambda x: prov_opts[x],
+                        key="po_selected_provider"
+                    )
                     if sel_prov_id:
-                         prov_detail = providers_dict.get(sel_prov_id)
-                         offering = next((o for o in prov_detail.get('catalogue',[]) if o['material_id'] == sel_mat_id), None)
-                         if offering: st.info(f"Price: €{offering['price_per_unit']:.2f}, Lead: {offering['lead_time_days']} days")
-                    qty_val = st.number_input("Quantity (units)", 1, 10000, 1)
-                    submit_dis = not sel_prov_id
-                if st.form_submit_button("Place Purchase Order", disabled=submit_dis) and sel_mat_id and sel_prov_id and qty_val > 0:
+                        offering = next(
+                            (o for o in providers_dict[sel_prov_id]['catalogue']
+                             if o['material_id'] == sel_mat_id),
+                            None
+                        )
+                        if offering:
+                            st.info(f"Price: €{offering['price_per_unit']:.2f}, Lead: {offering['lead_time_days']} days")
+                    qty_val = st.number_input(
+                        "Quantity (units)", 1, 10000, 1,
+                        key="po_selected_quantity"
+                    )
+                    submit_disabled = not sel_prov_id
+
+                if st.form_submit_button("Place Purchase Order", disabled=submit_disabled) \
+                   and sel_mat_id and sel_prov_id and qty_val > 0:
                     if create_purchase_order(sel_mat_id, sel_prov_id, qty_val):
                         load_inventory_data_cached.clear()
                         load_pending_purchase_orders_cached.clear()
                         st.rerun()
+
         with col2:
             st.subheader("Providers & Offerings")
             if providers_list_data:
