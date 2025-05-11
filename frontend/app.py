@@ -8,10 +8,10 @@ from api_client import (
     get_simulation_status, initialize_simulation, advance_day,
     get_materials, get_products, get_providers, get_inventory,
     get_production_orders, start_production, accept_production_order,
-    fulfill_accepted_production_order_from_stock, # New import
+    fulfill_accepted_production_order_from_stock,
     order_missing_materials_for_production_order,
     get_purchase_orders, create_purchase_order,
-    get_events, export_data, import_data, get_item_forecast # Added get_item_forecast
+    get_events, export_data, import_data, get_item_forecast
 )
 
 st.set_page_config(
@@ -32,48 +32,81 @@ def load_base_data():
 def load_inventory_data_cached():
     return get_inventory()
 
-@st.cache_data(ttl=10) # Cache forecast calls
+@st.cache_data(ttl=10)
 def load_item_forecast_cached(item_id: str, days: int, historical_lookback_days: int = 0):
     return get_item_forecast(item_id, days, historical_lookback_days)
+
+@st.cache_data(ttl=10) # Cache for 10 seconds
+def load_pending_purchase_orders_cached():
+    return get_purchase_orders(status="Ordered")
 
 def format_bom(bom_list, materials_dict_local, header=""):
     if not bom_list: return f"{header}No BOM defined" if header else "No BOM defined"
     lines = [header] if header else []
-    for item in bom_list: # bom_list is expected to be list of dicts like {'material_id': id, 'quantity': qty}
+    for item in bom_list:
         mat_id = item.get('material_id')
         qty = item.get('quantity', 'N/A')
         mat_name = materials_dict_local.get(mat_id, {}).get('name', mat_id)
         lines.append(f"- {mat_name}: {qty}")
     return "\n".join(lines)
 
-def format_material_list_with_stock_check(materials_needed_dict, physical_stock_levels, committed_stock_levels, materials_dict_local):
-    # materials_needed_dict: Dict[str, int] e.g. {'mat-001': 10}
-    # physical_stock_levels: Dict[str, int] e.g. {'mat-001': 5} (actual physical stock)
-    # committed_stock_levels: Dict[str, int] e.g. {'mat-001': 2} (committed to other orders)
+def format_material_list_with_stock_check(
+    materials_needed_dict,
+    physical_stock_levels,
+    committed_stock_levels,
+    global_on_order_info,     # Dict[str, int] - original total on order (for display)
+    allocatable_on_order_qty, # Mutable Dict[str, int] - remaining for allocation
+    materials_dict_local
+):
     if not materials_needed_dict:
-        return "N/A (No materials specified)", False # False for shortage_for_this_order
+        return "N/A (No materials specified)", False # shortage_for_this_order
 
     lines = []
-    shortage_for_this_order = False
+    overall_shortage_for_this_production_order = False # Tracks if any line has a true shortage
+
     for mat_id, qty_needed in materials_needed_dict.items():
         mat_name = materials_dict_local.get(mat_id, {}).get('name', mat_id)
         physical_qty = physical_stock_levels.get(mat_id, 0)
-        committed_qty = committed_stock_levels.get(mat_id,0) # Get committed stock for this material
-        # Available uncommitted = physical - committed (but don't let it go below zero for display)
-        # The backend logic for acceptance uses physical vs (physical - committed_elsewhere)
-        # For display on PENDING, we want to show Physical vs Need, and highlight if (Physical - Committed_to_others) is too low
-        # For simplicity, let's stick to showing Physical vs Need, as backend handles true uncommitted check
+        committed_qty = committed_stock_levels.get(mat_id, 0)
         
-        # Let's show: Need X, Physical Y, Committed (to others) Z
-        # Color based on whether Physical - Committed_to_others >= Need
         uncommitted_available = physical_qty - committed_qty
-        color = "green" if uncommitted_available >= qty_needed else "red"
+        line_shortage_exists = False # Shortage for this specific material line
+
+        display_text_parts = [f"- {mat_name}: Need {qty_needed}, Physical {physical_qty} (Committed: {committed_qty})"]
+        color = "green" # Default for sufficient physical stock
 
         if uncommitted_available < qty_needed:
-            shortage_for_this_order = True
-        lines.append(f"<span style='color:{color};'>- {mat_name}: Need {qty_needed}, Physical {physical_qty} (Committed: {committed_qty})</span>")
+            physical_shortfall = qty_needed - uncommitted_available
+            color = "red" # Default to red if physical shortage
+            line_shortage_exists = True
 
-    return "<br>".join(lines), shortage_for_this_order
+            # Check against allocatable on-order quantity
+            current_allocatable_for_mat = allocatable_on_order_qty.get(mat_id, 0)
+            global_total_on_order_for_mat = global_on_order_info.get(mat_id, 0)
+
+            if current_allocatable_for_mat > 0:
+                allocated_from_po = 0
+                if current_allocatable_for_mat >= physical_shortfall:
+                    allocated_from_po = physical_shortfall
+                    allocatable_on_order_qty[mat_id] = current_allocatable_for_mat - physical_shortfall
+                    color = "orange" # Fully covered by PO allocation
+                    display_text_parts.append(f"<span style='font-style:italic;'>(Shortfall of {physical_shortfall} covered by PO. Total on order: {global_total_on_order_for_mat})</span>")
+                    line_shortage_exists = False # Not a shortage for the button if PO covers it
+                else: # current_allocatable_for_mat < physical_shortfall
+                    allocated_from_po = current_allocatable_for_mat
+                    allocatable_on_order_qty[mat_id] = 0
+                    color = "#FF8C00" # Darker Orange for partially covered, still a shortage
+                    display_text_parts.append(f"<span style='font-style:italic;'>(Shortfall of {physical_shortfall}, PO covers {allocated_from_po}. Total on order: {global_total_on_order_for_mat})</span>")
+                    line_shortage_exists = True # Still a shortage as PO doesn't fully cover
+            elif global_total_on_order_for_mat > 0 : # Nothing allocatable NOW, but some were on order globally
+                 display_text_parts.append(f"<span style='font-style:italic;'>(No PO stock allocatable here. Total on order globally: {global_total_on_order_for_mat})</span>")
+                 # color remains red, line_shortage_exists remains true
+
+        lines.append(f"<span style='color:{color};'>{' '.join(display_text_parts)}</span>")
+        if line_shortage_exists:
+            overall_shortage_for_this_production_order = True
+            
+    return "<br>".join(lines), overall_shortage_for_this_production_order
 
 
 def format_catalogue(catalogue_list, materials_dict_local):
@@ -100,10 +133,21 @@ physical_stock_snapshot = {
     item_id: details.get('physical', 0)
     for item_id, details in inventory_items_detailed.items()
 }
-committed_stock_snapshot = { # Snapshot of total committed quantities for each item
+committed_stock_snapshot = {
     item_id: details.get('committed', 0)
     for item_id, details in inventory_items_detailed.items()
 }
+
+# Load and process pending purchase orders for material highlighting
+# This is the GLOBAL on-order quantity, used for display and initial allocation pool.
+pending_pos_data_global = load_pending_purchase_orders_cached()
+global_on_order_materials_info = {}
+if pending_pos_data_global:
+    for po in pending_pos_data_global:
+        mat_id = po.get('material_id')
+        qty_ordered = po.get('quantity_ordered', 0)
+        if mat_id and qty_ordered > 0:
+            global_on_order_materials_info[mat_id] = global_on_order_materials_info.get(mat_id, 0) + qty_ordered
 
 
 # --- Sidebar ---
@@ -125,7 +169,9 @@ if st.session_state.simulation_status:
 
     if st.sidebar.button("Advance 1 Day", use_container_width=True, type="primary"):
         if advance_day():
-            load_inventory_data_cached.clear(); st.rerun()
+            load_inventory_data_cached.clear()
+            load_pending_purchase_orders_cached.clear()
+            st.rerun()
 else:
     st.sidebar.warning("Simulation not running or API unreachable. Initialize first.")
 
@@ -185,45 +231,58 @@ elif page == "Production":
             Review new production requests.
             - **Accept Request**: Attempts to fulfill from existing finished product stock. If not fully available, it checks if required materials (uncommitted) are in stock. If both finished products and materials are insufficient, acceptance will fail. Otherwise, the order (or remaining part) is accepted and materials are committed.
             - **Order Missing Materials**: Check physical stock for required materials and place Purchase Orders for any shortages *for this specific request*.
+            Materials with shortfalls covered by incoming Purchase Orders will be shown in <span style='color:orange;'>orange</span>.
+            Partially covered or still short materials will be in <span style='color:#FF8C00;'>darker orange</span> or <span style='color:red;'>red</span>.
             """)
             pending_orders_data = get_production_orders(status="Pending")
+            
+            # Sort pending orders by creation date (ascending) for fair allocation
             if pending_orders_data:
+                pending_orders_data.sort(key=lambda x: pd.to_datetime(x.get('created_at', x.get('requested_date'))))
+
+                # This dictionary will be modified by format_material_list_with_stock_check
+                allocatable_on_order_qty_for_run = global_on_order_materials_info.copy()
+
                 for order in pending_orders_data:
                     product_name = products_dict.get(order['product_id'], {}).get('name', order['product_id'])
                     st.markdown(f"#### Order ID: `{order['id']}`")
 
                     col_details, col_actions = st.columns([3,1])
                     with col_details:
-                        st.markdown(f"**Product:** {product_name} | **Qty:** {order['quantity']} | **Requested:** {pd.to_datetime(order['requested_date']).strftime('%Y-%m-%d')}")
+                        st.markdown(f"**Product:** {product_name} | **Qty:** {order['quantity']} | **Created:** {pd.to_datetime(order.get('created_at', order.get('requested_date'))).strftime('%Y-%m-%d %H:%M')}")
 
                         finished_prod_stock = physical_stock_snapshot.get(order['product_id'], 0)
                         if finished_prod_stock > 0:
                             st.info(f"ℹ️ **Note:** {finished_prod_stock} units of '{product_name}' are currently in physical stock.")
 
                         if order.get('required_materials'):
-                            materials_display_html, shortage_exists = format_material_list_with_stock_check(
+                            materials_display_html, shortage_exists_for_order_button = format_material_list_with_stock_check(
                                 order['required_materials'],
                                 physical_stock_snapshot,
-                                committed_stock_snapshot, # Pass overall committed stock
+                                committed_stock_snapshot,
+                                global_on_order_materials_info, # Pass for display of total
+                                allocatable_on_order_qty_for_run, # Pass for mutable allocation
                                 materials_dict
                             )
                             st.markdown("**Material Availability (Need vs. Physical Stock - Committed to Others):**")
                             st.markdown(materials_display_html, unsafe_allow_html=True)
                         else:
-                            shortage_exists = False
+                            shortage_exists_for_order_button = False
                             st.warning("No required materials listed for this pending order (BOM might be missing or quantity is zero).")
 
                     with col_actions:
                         if st.button("✅ Accept Request", key=f"accept_{order['id']}", use_container_width=True):
-                            if accept_production_order(order['id']): # Backend handles all logic
-                                load_inventory_data_cached.clear(); st.rerun()
+                            if accept_production_order(order['id']):
+                                load_inventory_data_cached.clear()
+                                load_pending_purchase_orders_cached.clear()
+                                st.rerun()
 
-                        # Only show "Order Missing Materials" if materials are listed and a shortage is indicated by the display function
-                        # This button is more for pre-emptive ordering before attempting acceptance.
-                        if order.get('required_materials') and shortage_exists :
+                        if order.get('required_materials') and shortage_exists_for_order_button :
                              if st.button("🛒 Order Missing Materials", key=f"order_missing_{order['id']}", use_container_width=True):
                                 if order_missing_materials_for_production_order(order['id']):
-                                    load_inventory_data_cached.clear(); st.rerun()
+                                    load_inventory_data_cached.clear()
+                                    load_pending_purchase_orders_cached.clear()
+                                    st.rerun()
                     st.markdown("---")
             else: st.info("No pending production requests.")
 
@@ -238,9 +297,6 @@ elif page == "Production":
             accepted_orders_data = get_production_orders(status="Accepted")
 
             if accepted_orders_data:
-                # Prepare data for st.data_editor (if used for selection) or iterate directly
-                selected_order_ids_for_production = [] # For batch "Send to Production"
-
                 for i, order in enumerate(accepted_orders_data):
                     order_id = order['id']
                     product_id = order['product_id']
@@ -256,7 +312,6 @@ elif page == "Production":
                         st.write(f"**Quantity Needed:** {qty_needed}")
                         st.write(f"**Requested Date:** {requested_date_str}")
 
-                        # Display committed materials for this order
                         if order.get('committed_materials'):
                             st.markdown("**Materials Committed for this Order:**")
                             committed_display = format_bom(
@@ -267,7 +322,6 @@ elif page == "Production":
                         else:
                             st.warning("No materials appear to be committed for this accepted order. This might indicate an issue.")
 
-                        # Check and display finished product stock
                         finished_product_stock = physical_stock_snapshot.get(product_id, 0)
                         color = "green" if finished_product_stock >= qty_needed else "red"
                         st.markdown(f"**Finished Product Stock for '{product_name}':** <span style='color:{color};'>{finished_product_stock} available</span>", unsafe_allow_html=True)
@@ -277,15 +331,13 @@ elif page == "Production":
                         if st.button("✅ Fulfill from Stock", key=f"fulfill_accepted_{order_id}", use_container_width=True, disabled=not can_fulfill_now):
                             if fulfill_accepted_production_order_from_stock(order_id):
                                 load_inventory_data_cached.clear()
+                                load_pending_purchase_orders_cached.clear()
                                 st.rerun()
 
-                        # Checkbox for selecting order to send to production (example if using data_editor later or manual selection)
-                        # For simplicity, let's add a direct "Send to Production" button per order for now.
-                        # Or we can collect them for a batch button at the bottom.
-                        # Let's use a direct button per order for now to simplify UI state management.
                         if st.button("➡️ Send to Production", key=f"start_single_accepted_{order_id}", use_container_width=True):
-                            if start_production([order_id]): # start_production expects a list
+                            if start_production([order_id]):
                                 load_inventory_data_cached.clear()
+                                load_pending_purchase_orders_cached.clear()
                                 st.rerun()
                     st.markdown("---")
             else:
@@ -300,7 +352,6 @@ elif page == "Production":
                  orders_df_prog = pd.DataFrame(in_progress_orders)
                  orders_df_prog['Product'] = orders_df_prog['product_id'].apply(lambda x: products_dict.get(x, {}).get('name', x))
                  orders_df_prog['Started At'] = orders_df_prog['started_at'].apply(lambda x: pd.to_datetime(x).strftime('%Y-%m-%d %H:%M') if pd.notnull(x) else 'N/A')
-                 # Display originally committed materials for reference
                  orders_df_prog['Committed Materials (at start)'] = orders_df_prog['committed_materials'].apply(lambda x: format_bom([{'material_id': k, 'quantity': v} for k,v in x.items()], materials_dict) if x else "N/A")
                  st.dataframe(orders_df_prog[['id', 'Product', 'quantity', 'Started At', 'Committed Materials (at start)']].rename(columns={'id':'Order ID', 'quantity':'Qty'}),
                               use_container_width=True, hide_index=True)
@@ -325,7 +376,6 @@ elif page == "Production":
             if fulfilled_orders_data:
                 orders_df_ful = pd.DataFrame(fulfilled_orders_data)
                 orders_df_ful['Product'] = orders_df_ful['product_id'].apply(lambda x: products_dict.get(x, {}).get('name', x))
-                # 'completed_at' is used for fulfillment time for these orders
                 orders_df_ful['Fulfilled At'] = orders_df_ful['completed_at'].apply(lambda x: pd.to_datetime(x).strftime('%Y-%m-%d %H:%M') if pd.notnull(x) else 'N/A')
                 st.dataframe(orders_df_ful[['id', 'Product', 'quantity', 'Fulfilled At']].rename(columns={'id':'Order ID', 'quantity':'Qty Fulfilled'}),
                               use_container_width=True, hide_index=True)
@@ -356,11 +406,13 @@ elif page == "Purchasing":
                          prov_detail = providers_dict.get(sel_prov_id)
                          offering = next((o for o in prov_detail.get('catalogue',[]) if o['material_id'] == sel_mat_id), None)
                          if offering: st.info(f"Price: €{offering['price_per_unit']:.2f}, Lead: {offering['lead_time_days']} days")
-                    qty_val = st.number_input("Quantity (units)", 1, 10000, 1) # Increased max quantity
+                    qty_val = st.number_input("Quantity (units)", 1, 10000, 1)
                     submit_dis = not sel_prov_id
                 if st.form_submit_button("Place Purchase Order", disabled=submit_dis) and sel_mat_id and sel_prov_id and qty_val > 0:
                     if create_purchase_order(sel_mat_id, sel_prov_id, qty_val):
-                        load_inventory_data_cached.clear(); st.rerun()
+                        load_inventory_data_cached.clear()
+                        load_pending_purchase_orders_cached.clear() # Also clear PO cache
+                        st.rerun()
         with col2:
             st.subheader("Providers & Offerings")
             if providers_list_data:
@@ -371,12 +423,12 @@ elif page == "Purchasing":
             else: st.info("No providers defined.")
         st.divider()
         st.subheader("Pending Purchase Orders")
-        pending_pos = get_purchase_orders(status="Ordered")
-        if pending_pos:
+        # Use global_on_order_materials_info which is already from pending_pos_data_global
+        if pending_pos_data_global: # Re-use the fetched data
             pos_df = pd.DataFrame([{"PO ID": po['id'], "Material": materials_dict.get(po['material_id'],{}).get('name', po['material_id']),
                                    "Qty": po['quantity_ordered'], "Provider": providers_dict.get(po['provider_id'],{}).get('name', po['provider_id']),
                                    "Ordered": pd.to_datetime(po['order_date']).strftime('%Y-%m-%d %H:%M'),
-                                   "ETA": pd.to_datetime(po['expected_arrival_date']).strftime('%Y-%m-%d')} for po in pending_pos])
+                                   "ETA": pd.to_datetime(po['expected_arrival_date']).strftime('%Y-%m-%d')} for po in pending_pos_data_global])
             st.dataframe(pos_df, use_container_width=True, hide_index=True)
         else: st.info("No pending purchase orders.")
 
@@ -387,7 +439,7 @@ elif page == "Inventory":
     else:
         if inventory_items_detailed:
             inv_list = [{"ID": item_id, "Name": det.get('name',item_id), "Type": det.get('type',"Unk"),
-                           "Physical": det.get('physical',0), "Committed": det.get('committed',0), # Total committed
+                           "Physical": det.get('physical',0), "Committed": det.get('committed',0),
                            "On Order": det.get('on_order',0), "Projected": det.get('projected_available',0)}
                           for item_id, det in inventory_items_detailed.items()]
             if inv_list:
@@ -398,8 +450,8 @@ elif page == "Inventory":
                  chart_sel = st.selectbox("Chart Data:", chart_cols, index=0)
 
                  fig_data = inv_df.copy()
-                 if chart_sel == "On Order": fig_data = fig_data[fig_data["Type"] == "Material"] # On Order only for materials
-                 fig_data = fig_data[fig_data[chart_sel] != 0] # Filter out zero values for the selected metric
+                 if chart_sel == "On Order": fig_data = fig_data[fig_data["Type"] == "Material"]
+                 fig_data = fig_data[fig_data[chart_sel] != 0]
 
                  if not fig_data.empty:
                     fig = px.bar(fig_data.sort_values(chart_sel, ascending=False).head(20),
@@ -412,7 +464,6 @@ elif page == "Inventory":
         st.divider()
         st.subheader("📈 Item Stock Forecast")
         
-        # Prepare item list for dropdown (materials and products)
         all_items_for_select = []
         if materials_list_data:
             all_items_for_select.extend([
@@ -446,34 +497,22 @@ elif page == "Inventory":
             )
 
             if selected_item_id and selected_forecast_days:
-                # Let's add a fixed historical lookback for visual context
-                # historical_days_to_show = 3 # Old fixed value
-                if selected_forecast_days == 7:
-                    historical_days_to_show = 3
-                elif selected_forecast_days == 14:
-                    historical_days_to_show = 5
-                elif selected_forecast_days == 30:
-                    historical_days_to_show = 10
-                else: # Default for any other selection
-                    historical_days_to_show = 3
+                if selected_forecast_days == 7: historical_days_to_show = 3
+                elif selected_forecast_days == 14: historical_days_to_show = 5
+                elif selected_forecast_days == 30: historical_days_to_show = 10
+                else: historical_days_to_show = 3
 
                 forecast_data_response = load_item_forecast_cached(selected_item_id, selected_forecast_days, historical_days_to_show)
                 
                 if forecast_data_response and 'forecast' in forecast_data_response and forecast_data_response['forecast']:
                     forecast_df = pd.DataFrame(forecast_data_response['forecast'])
-                    forecast_df['date'] = pd.to_datetime(forecast_df['date']) # Ensure date is datetime type
-                    forecast_df = forecast_df.sort_values(by='date') # Ensure data is sorted by date
+                    forecast_df['date'] = pd.to_datetime(forecast_df['date'])
+                    forecast_df = forecast_df.sort_values(by='date')
 
                     item_display_name = forecast_data_response.get('item_name', selected_item_id)
-                    
-                    # Find the current date (where day_offset is 0)
                     current_day_data = forecast_df[forecast_df['day_offset'] == 0]
                     current_date_vline = current_day_data['date'].iloc[0] if not current_day_data.empty else None
-
-                    # Create the figure
                     fig_forecast = px.line(title=f"Projected Stock for '{item_display_name}'")
-
-                    # Split data for different colors
                     past_and_current_df = forecast_df[forecast_df['day_offset'] <= 0]
                     current_and_future_df = forecast_df[forecast_df['day_offset'] >= 0]
 
@@ -485,48 +524,28 @@ elif page == "Inventory":
                         )
                     
                     if not current_and_future_df.empty:
-                        # Ensure the "future" trace starts from the current day to connect smoothly
                         fig_forecast.add_trace(
                             px.line(current_and_future_df, x='date', y='quantity').data[0].update(
                                 line=dict(color='darkorange'), name='Forecast'
                             )
                         )
                     
-                    # Add a vertical line for the current day
                     if current_date_vline:
-                        fig_forecast.add_vline(
-                            x=current_date_vline, 
-                            line_width=2, 
-                            line_dash="solid", 
-                            line_color="green"
-                        )
-                        # Add annotation separately to avoid the sum() error with Timestamps
+                        fig_forecast.add_vline(x=current_date_vline, line_width=2, line_dash="solid", line_color="green")
                         fig_forecast.add_annotation(
-                            x=current_date_vline,
-                            y=1.03, # Position slightly above the top of the plot
-                            yref="paper", # Y coordinate is relative to the paper viewport
-                            text="Current Day",
-                            showarrow=False,
-                            font=dict(
-                                color="green",
-                                size=12
-                            ),
-                            xanchor="center", # Anchor the text's center to the vline
-                            yanchor="bottom"  # Anchor the text's bottom
+                            x=current_date_vline, y=1.03, yref="paper", text="Current Day",
+                            showarrow=False, font=dict(color="green", size=12),
+                            xanchor="center", yanchor="bottom"
                         )
                     
-                    fig_forecast.update_layout(
-                        xaxis_title='Date', 
-                        yaxis_title='Projected Quantity',
-                        legend_title_text='Legend'
-                    )
+                    fig_forecast.update_layout(xaxis_title='Date', yaxis_title='Projected Quantity', legend_title_text='Legend')
                     fig_forecast.update_traces(mode='lines+markers')
                     st.plotly_chart(fig_forecast, use_container_width=True)
-                elif forecast_data_response is None and st.session_state.simulation_status: # API call failed but sim is running
+                elif forecast_data_response is None and st.session_state.simulation_status:
                     st.warning(f"Could not retrieve forecast data for item ID '{selected_item_id}'. The item might not exist or an error occurred.")
                 elif not st.session_state.simulation_status:
                      st.info("Simulation not initialized. Forecast unavailable.")
-                else: # No data returned, or empty forecast list
+                else:
                     st.info(f"No forecast data available for '{selected_item_id}' for the selected period.")
 
 
@@ -545,14 +564,13 @@ elif page == "History":
                 sel_ev_id = st.selectbox("Event ID:", options=df['id'].tolist(), index=None)
                 if sel_ev_id: st.json(df[df['id'] == sel_ev_id]['details'].iloc[0])
 
-            # Demand vs Fulfillment Charting (simplified as per previous state)
             demand_events = df[df['event_type'].isin(['order_received_for_production', 'product_shipped_from_stock', 'production_order_fulfilled_from_stock', 'accepted_order_fulfilled_from_stock'])].copy()
             if not demand_events.empty:
                 demand_events['day'] = demand_events['day'].astype(int)
                 def get_demand_qty(row):
                     if row['event_type'] == 'order_received_for_production': return row['details'].get('original_demand', row['details'].get('qty_for_prod',0))
                     if row['event_type'] == 'product_shipped_from_stock': return row['details'].get('demand_qty', row['details'].get('qty_shipped',0))
-                    return 0 # For other types, it's fulfillment not new demand
+                    return 0
                 demand_events['total_demand_qty'] = demand_events.apply(get_demand_qty, axis=1)
                 demand_per_day = demand_events[demand_events['total_demand_qty'] > 0].groupby('day')['total_demand_qty'].sum().reset_index()
 
@@ -560,7 +578,6 @@ elif page == "History":
                     if row['event_type'] == 'product_shipped_from_stock': return row['details'].get('qty_shipped', 0)
                     if row['event_type'] == 'production_order_fulfilled_from_stock': return row['details'].get('quantity_fulfilled', 0)
                     if row['event_type'] == 'accepted_order_fulfilled_from_stock': return row['details'].get('quantity_fulfilled', 0)
-                    # For 'order_received_for_production', if it had 'fulfilled_stock' field
                     if row['event_type'] == 'order_received_for_production': return row['details'].get('fulfilled_stock',0)
                     return 0
                 demand_events['fulfilled_stock_qty'] = demand_events.apply(get_fulfilled_qty, axis=1)
@@ -618,7 +635,9 @@ elif page == "Setup & Data":
         try:
             conditions_data = json.loads(edited_conditions_str)
             if initialize_simulation(conditions_data):
-                 load_base_data.clear(); load_inventory_data_cached.clear()
+                 load_base_data.clear()
+                 load_inventory_data_cached.clear()
+                 load_pending_purchase_orders_cached.clear()
                  st.rerun()
         except json.JSONDecodeError: st.error("Invalid JSON format in Initial Conditions.")
         except Exception as e: st.error(f"Error initializing simulation: {e}")
@@ -645,7 +664,10 @@ elif page == "Setup & Data":
                 if "simulation_state" in import_json_data and "products" in import_json_data and "materials" in import_json_data:
                      if st.button("Confirm Import Data", type="danger"):
                          if import_data(import_json_data):
-                             load_base_data.clear(); load_inventory_data_cached.clear() # Rerun handled by import_data
+                             load_base_data.clear()
+                             load_inventory_data_cached.clear()
+                             load_pending_purchase_orders_cached.clear()
+                             # st.rerun() is handled by import_data in api_client if successful
                 else: st.error("Uploaded file does not appear to be a valid simulation export (missing key fields).")
             except json.JSONDecodeError: st.error("Invalid JSON file.")
             except Exception as e: st.error(f"Error processing import file: {e}")

@@ -77,12 +77,10 @@ class FactorySimulation:
         fulfilled_from_stock_qty = 0
         quantity_to_produce = original_order_quantity
 
-        # 1. Check finished product stock
         physical_stock_of_product = self.state.inventory.get(order.product_id, 0)
 
         if physical_stock_of_product > 0:
             if physical_stock_of_product >= quantity_to_produce:
-                # Fulfill entirely from stock
                 await self.update_inventory(order.product_id, -quantity_to_produce, is_physical=True)
                 order.status = "Fulfilled"
                 order.completed_at = utils.get_current_utc_timestamp()
@@ -96,13 +94,12 @@ class FactorySimulation:
                 })
                 await crud.save_simulation_state(self.state)
                 return True, f"Order {order.id} for {original_order_quantity}x {product_to_make.name} fulfilled directly from stock."
-            else: # Partial fulfillment from stock
+            else: 
                 await self.update_inventory(order.product_id, -physical_stock_of_product, is_physical=True)
                 fulfilled_from_stock_qty = physical_stock_of_product
                 quantity_to_produce = original_order_quantity - fulfilled_from_stock_qty
-                order.quantity = quantity_to_produce # Update order quantity to remaining
+                order.quantity = quantity_to_produce 
 
-                # Recalculate required_materials for the new, smaller quantity
                 new_required_materials = {}
                 for bom_item in product_to_make.bom:
                     new_required_materials[bom_item.material_id] = \
@@ -117,58 +114,51 @@ class FactorySimulation:
                 })
                 logger.info(f"Order {order_id} partially fulfilled. {fulfilled_from_stock_qty} from stock. Remaining {quantity_to_produce} for production.")
 
-        # 2. If quantity_to_produce > 0, check material availability for acceptance
         if quantity_to_produce > 0:
-            if not order.required_materials: # Should be populated if not fulfilled
-                 # This case should ideally be handled by order creation or the partial fulfillment update above
+            if not order.required_materials:
                 temp_req_mats = {}
                 for bom_item in product_to_make.bom:
                     temp_req_mats[bom_item.material_id] = temp_req_mats.get(bom_item.material_id, 0) + (bom_item.quantity * quantity_to_produce)
                 order.required_materials = temp_req_mats
 
-
-            # Material Check for Acceptance
             materials_ok_for_acceptance = True
             insufficient_material_details = ""
             materials_to_commit_upon_acceptance = {}
 
             for mat_id, qty_needed in order.required_materials.items():
                 physical_mat_stock = self.state.inventory.get(mat_id, 0)
-                # Uncommitted stock = physical - total committed to other orders (accepted or in-progress)
-                # For this check, committed_inventory should represent commitments for orders ALREADY accepted or in-progress
-                already_committed_qty = self.state.committed_inventory.get(mat_id, 0)
-                available_uncommitted_stock = physical_mat_stock # Not subtracting committed_inventory here, as we commit from physical.
-                                                              # The check is whether physical has enough.
-
-                if available_uncommitted_stock < qty_needed:
+                already_committed_qty_to_others = self.state.committed_inventory.get(mat_id, 0)
+                available_uncommitted_stock_for_acceptance = physical_mat_stock - already_committed_qty_to_others
+                
+                if available_uncommitted_stock_for_acceptance < qty_needed:
                     materials_ok_for_acceptance = False
                     material_name = self.materials.get(mat_id, Material(id=mat_id, name=mat_id)).name
-                    insufficient_material_details = f"Insufficient uncommitted material: {material_name}. Need: {qty_needed}, Available (Physical): {available_uncommitted_stock}."
+                    insufficient_material_details = f"Insufficient uncommitted material: {material_name}. Need: {qty_needed}, Effectively Available: {available_uncommitted_stock_for_acceptance} (Physical: {physical_mat_stock} - Committed to others: {already_committed_qty_to_others})."
                     await self.log_sim_event("acceptance_failed_material_shortage", {
                         "order_id": order.id, "material_id": mat_id, "needed": qty_needed,
-                        "available_physical": available_uncommitted_stock
+                        "available_effective": available_uncommitted_stock_for_acceptance,
+                        "physical_stock": physical_mat_stock,
+                        "committed_to_others": already_committed_qty_to_others
                     })
                     break
                 else:
                     materials_to_commit_upon_acceptance[mat_id] = qty_needed
 
             if not materials_ok_for_acceptance:
-                # Order remains "Pending"
                 message = f"Order {order.id} for {product_to_make.name} ({quantity_to_produce} units) cannot be accepted. {insufficient_material_details}"
                 if fulfilled_from_stock_qty > 0:
                     message = f"{fulfilled_from_stock_qty} units of {product_to_make.name} fulfilled from stock. Remaining {quantity_to_produce} units for Order {order.id} cannot be accepted. {insufficient_material_details}"
                 return False, message
 
-            # If materials are OK, commit them and set status to "Accepted"
-            order.committed_materials.clear() # Clear any prior (e.g. from a previous failed attempt if logic allowed)
+            order.committed_materials.clear() 
             for mat_id, qty_to_commit in materials_to_commit_upon_acceptance.items():
-                await self.update_inventory(mat_id, -qty_to_commit, is_physical=True)  # Decrease physical
-                await self.update_inventory(mat_id, qty_to_commit, is_physical=False) # Increase overall committed pool
+                await self.update_inventory(mat_id, -qty_to_commit, is_physical=True)
+                await self.update_inventory(mat_id, qty_to_commit, is_physical=False) 
                 order.committed_materials[mat_id] = qty_to_commit
 
             order.status = "Accepted"
             await crud.update_item(crud.COLLECTIONS["production_orders"], order.id,
-                                   order.model_dump(include={"status", "committed_materials", "quantity", "required_materials"})) # ensure quantity/req_mats are saved if changed
+                                   order.model_dump(include={"status", "committed_materials", "quantity", "required_materials"}))
             await self.log_sim_event("production_order_accepted_materials_committed", {
                 "order_id": order.id,
                 "original_requested_quantity": original_order_quantity,
@@ -182,52 +172,93 @@ class FactorySimulation:
                  message = f"{fulfilled_from_stock_qty} units of {product_to_make.name} fulfilled from stock. Remaining {quantity_to_produce} units for Order {order.id} accepted and materials committed."
             return True, message
 
-        # If quantity_to_produce was 0 (fully fulfilled by stock), we already returned.
-        # This path should not be reached if fully fulfilled.
-        return False, "Order processing error." # Should be covered by previous returns
+        return False, "Order processing error."
 
     async def place_purchase_order_for_shortages(self, production_order_id: str) -> Dict[str, str]:
         order = await self.get_production_order_async(production_order_id)
         if not order: return {"error": "Production order not found."}
-        if order.status not in ["Pending", "Accepted"]: return {"error": f"Cannot order materials for order with status '{order.status}'."}
+        if order.status not in ["Pending", "Accepted"]:
+            return {"error": f"Cannot order materials for order with status '{order.status}'."}
+        
         product = self.products.get(order.product_id)
         if not product: return {"error": f"Product definition for {order.product_id} not found."}
 
         if not order.required_materials:
             calculated_req_materials = {}
             for bom_item in product.bom:
-                calculated_req_materials[bom_item.material_id] = calculated_req_materials.get(bom_item.material_id, 0) + (bom_item.quantity * order.quantity)
+                calculated_req_materials[bom_item.material_id] = \
+                    calculated_req_materials.get(bom_item.material_id, 0) + (bom_item.quantity * order.quantity)
             order.required_materials = calculated_req_materials
-            await crud.update_item(crud.COLLECTIONS["production_orders"], order.id, {"required_materials": order.required_materials})
+            # No need to save to DB here, it's an in-memory modification for this function's scope
+            # await crud.update_item(crud.COLLECTIONS["production_orders"], order.id, {"required_materials": order.required_materials})
 
-        results = {}; materials_ordered_summary = []
-        for mat_id, qty_needed_total in order.required_materials.items():
+
+        results = {}
+        materials_ordered_summary = []
+        for mat_id, qty_needed_for_order in order.required_materials.items():
             current_physical_stock = self.state.inventory.get(mat_id, 0)
-            # Consider committed stock for other orders if this order is still 'Pending'.
-            # If 'Accepted', its materials are already notionally committed or were checked.
-            # This function is often for 'Pending' orders, so check physical vs need.
-            shortage_quantity = qty_needed_total - current_physical_stock
+            total_committed_globally = self.state.committed_inventory.get(mat_id, 0)
+            
+            actual_need_to_source_for_this_mat_line = qty_needed_for_order
+            
+            # If the order is "Accepted", we need to figure out how much *more* is needed beyond what was already committed for it.
+            # And the available physical should be reduced by commitments to *other* orders.
+            committed_for_this_order_already = 0
+            if order.status == "Accepted":
+                committed_for_this_order_already = order.committed_materials.get(mat_id, 0)
+                
+            # The portion of total_committed_globally that is *not* for the current order (if it's accepted)
+            committed_elsewhere = total_committed_globally - committed_for_this_order_already
+            
+            # Effective physical stock available for this specific need (before committing this order or for this order's additional need)
+            effective_available_physical = current_physical_stock - committed_elsewhere
+            
+            # If order is "Accepted", we're interested in the shortfall beyond what's already committed TO IT.
+            if order.status == "Accepted":
+                actual_need_to_source_for_this_mat_line = qty_needed_for_order - committed_for_this_order_already
+
+            if actual_need_to_source_for_this_mat_line <= 0: # Already fully covered if accepted, or not needed
+                results[mat_id] = f"No additional sourcing needed for {self.materials.get(mat_id, Material(id=mat_id, name=mat_id)).name} (Needed for this action: {actual_need_to_source_for_this_mat_line})."
+                continue
+
+            shortage_quantity = actual_need_to_source_for_this_mat_line - effective_available_physical
 
             if shortage_quantity > 0:
-                best_provider_id = None; min_price = float('inf')
+                best_provider_id = None
+                min_price = float('inf')
+                material_obj = self.materials.get(mat_id)
+                if not material_obj:
+                    results[mat_id] = f"Material definition for {mat_id} not found."
+                    continue
+
                 for prov_id, provider_obj in self.providers.items():
                     for offering in provider_obj.catalogue:
                         if offering.material_id == mat_id and offering.price_per_unit < min_price:
-                            min_price = offering.price_per_unit; best_provider_id = prov_id
+                            min_price = offering.price_per_unit
+                            best_provider_id = prov_id
+                
                 if best_provider_id:
                     try:
+                        # Order the calculated shortage_quantity
                         po = await self.place_purchase_order(mat_id, best_provider_id, shortage_quantity)
-                        results[mat_id] = f"Ordered {shortage_quantity} from {self.providers[best_provider_id].name} (PO: {po.id})."
-                        materials_ordered_summary.append(f"{mat_id}: {shortage_quantity}")
-                    except ValueError as e: results[mat_id] = f"Error: {str(e)}"
+                        results[mat_id] = f"Ordered {shortage_quantity} of {material_obj.name} from {self.providers[best_provider_id].name} (PO: {po.id})."
+                        materials_ordered_summary.append(f"{material_obj.name}: {shortage_quantity}")
+                    except ValueError as e:
+                        results[mat_id] = f"Error placing PO for {material_obj.name}: {str(e)}"
                 else:
-                    results[mat_id] = f"No provider for {mat_id}."
-                    await self.log_sim_event("material_shortage_no_provider", {"order_id":order.id, "mat_id":mat_id, "needed":shortage_quantity})
+                    results[mat_id] = f"No provider found for {material_obj.name}."
+                    await self.log_sim_event("material_shortage_no_provider", {
+                        "order_id": order.id, "mat_id": mat_id, "needed": shortage_quantity
+                    })
             else:
-                results[mat_id] = f"Sufficient physical stock ({current_physical_stock} for need of {qty_needed_total})."
+                results[mat_id] = f"Sufficient effective stock for {self.materials.get(mat_id, Material(id=mat_id, name=mat_id)).name}. Need to source: {actual_need_to_source_for_this_mat_line}, Effective Available: {effective_available_physical}."
+        
         if materials_ordered_summary:
-             await self.log_sim_event("auto_ordered_materials_for_prod_order", {"order_id":order.id, "ordered":materials_ordered_summary})
-        await crud.save_simulation_state(self.state)
+             await self.log_sim_event("auto_ordered_materials_for_prod_order", {
+                 "order_id": order.id, "ordered_summary": materials_ordered_summary
+            })
+        # No explicit save_simulation_state here, as place_purchase_order saves it if a PO is made.
+        # If no POs are made, state might not need saving from this specific action.
         return results
 
     async def run_day(self):
@@ -241,7 +272,7 @@ class FactorySimulation:
         current_sim_processing_datetime = SIMULATION_EPOCH_DATETIME + timedelta(days=current_day_offset)
         current_sim_processing_date = current_sim_processing_datetime.date()
 
-        for po_id in pending_po_ids: # PO Arrivals
+        for po_id in pending_po_ids: 
             po = await self.get_purchase_order_async(po_id)
             if not po:
                 if po_id in self.state.pending_purchase_orders: self.state.pending_purchase_orders.remove(po_id)
@@ -260,7 +291,7 @@ class FactorySimulation:
 
         completed_production_today = 0
         active_order_ids_today = self.state.active_production_orders[:]
-        for order_id in active_order_ids_today: # Production Completion
+        for order_id in active_order_ids_today: 
             order = await self.get_production_order_async(order_id)
             if not order or order.status != "In Progress":
                 if order_id in self.state.active_production_orders: self.state.active_production_orders.remove(order_id)
@@ -273,17 +304,12 @@ class FactorySimulation:
                 days_in_production = (current_sim_processing_datetime.date() - started_at_aware.date()).days
                 if days_in_production >= product.production_time:
                     if completed_production_today < self.state.daily_production_capacity:
-                        # Materials were already committed (moved from physical to committed_inventory) when production started (or accepted).
-                        # Now, consume them from committed_inventory.
                         if order.committed_materials:
                             for mat_id, qty_consumed in order.committed_materials.items():
-                                # Decrease the overall committed pool
                                 await self.update_inventory(mat_id, -qty_consumed, is_physical=False)
-                        # Add finished product to physical inventory
                         await self.update_inventory(order.product_id, order.quantity, is_physical=True)
 
                         order.status = "Completed"; order.completed_at = current_sim_processing_datetime
-                        # order.committed_materials can be cleared or kept for history. Let's keep.
                         await crud.update_item(crud.COLLECTIONS["production_orders"], order.id, order.model_dump(exclude_none=True, include={"status", "completed_at"}))
                         if order_id in self.state.active_production_orders: self.state.active_production_orders.remove(order_id)
                         await self.log_sim_event("production_completed", {"order_id":order.id, "prod_id":order.product_id, "qty":order.quantity})
@@ -309,12 +335,6 @@ class FactorySimulation:
             product_obj = self.products[product_id]
             logger.info(f"New demand: {requested_quantity}x {product_obj.name} (ID: {product_id}).")
 
-            # This random order generation does not automatically try to accept. It creates a "Pending" order.
-            # The accept_production_order logic will handle stock fulfillment if called on this pending order.
-            # For simplicity here, we'll just create a pending order.
-            # If we wanted to simulate direct fulfillment for random orders *without* going through "Pending",
-            # that logic would be here. But user's request is about manual acceptance.
-
             required_materials = {}
             for bom_item in product_obj.bom:
                 required_materials[bom_item.material_id] = required_materials.get(bom_item.material_id, 0) + (bom_item.quantity * requested_quantity)
@@ -325,16 +345,14 @@ class FactorySimulation:
                 required_materials=required_materials, created_at=utils.get_current_utc_timestamp()
             )
             await crud.create_item(crud.COLLECTIONS["production_orders"], new_order.model_dump())
-            await self.log_sim_event("order_received_for_production", { # This event is for a new pending request
+            await self.log_sim_event("order_received_for_production", { 
                 "order_id": new_order.id, "product_id": product_id, "qty_for_prod": requested_quantity,
-                "original_demand": requested_quantity, "fulfilled_stock": 0 # Not attempting direct fulfillment here
+                "original_demand": requested_quantity, "fulfilled_stock": 0
             })
             logger.info(f"Prod Order {new_order.id} for {requested_quantity}x {product_obj.name} created as 'Pending'.")
 
 
     async def start_production(self, order_ids: List[str]) -> Dict[str, str]:
-        # This is triggered for "Accepted" orders.
-        # Materials are assumed to be already committed when the order moved to "Accepted".
         results = {}
         current_sim_datetime_for_start = SIMULATION_EPOCH_DATETIME + timedelta(days=self.state.current_day)
         for order_id in order_ids:
@@ -344,8 +362,6 @@ class FactorySimulation:
                 results[order_id] = f"Order status is '{order.status}', must be 'Accepted'."
                 continue
 
-            # No material check or commitment needed here anymore, as it's done at 'Accepted' stage.
-            # Simply change status and log.
             order.status = "In Progress"
             order.started_at = current_sim_datetime_for_start
 
@@ -356,9 +372,9 @@ class FactorySimulation:
                 self.state.active_production_orders.append(order.id)
 
             results[order_id] = "Production started successfully."
-            await self.log_sim_event("production_started", { # Simpler event, materials were committed earlier
+            await self.log_sim_event("production_started", { 
                 "order_id": order.id, "product_id": order.product_id,
-                "previously_committed_materials": order.committed_materials # For reference
+                "previously_committed_materials": order.committed_materials 
             })
 
         await crud.save_simulation_state(self.state)
@@ -373,23 +389,20 @@ class FactorySimulation:
         product_to_fulfill = self.products.get(order.product_id)
         if not product_to_fulfill: return False, f"Product definition for {order.product_id} not found."
 
-        # Check if finished product is now available
         physical_stock_of_product = self.state.inventory.get(order.product_id, 0)
         if physical_stock_of_product < order.quantity:
             return False, f"Insufficient finished product '{product_to_fulfill.name}' in stock. Need: {order.quantity}, Have: {physical_stock_of_product}."
 
-        # Fulfill from stock
         await self.update_inventory(order.product_id, -order.quantity, is_physical=True)
 
-        # Un-commit materials that were previously committed for this order
         if order.committed_materials:
             for mat_id, qty_committed in order.committed_materials.items():
-                await self.update_inventory(mat_id, qty_committed, is_physical=True)  # Return to physical
-                await self.update_inventory(mat_id, -qty_committed, is_physical=False) # Decrease overall committed pool
+                await self.update_inventory(mat_id, qty_committed, is_physical=True) 
+                await self.update_inventory(mat_id, -qty_committed, is_physical=False)
             await self.log_sim_event("materials_uncommitted_for_fulfillment", {
                 "order_id": order.id, "uncommitted_materials": order.committed_materials
             })
-        order.committed_materials.clear() # Clear the committed materials on the order
+        order.committed_materials.clear() 
 
         order.status = "Fulfilled"
         order.completed_at = utils.get_current_utc_timestamp()
@@ -410,6 +423,10 @@ class FactorySimulation:
         offering = next((o for o in provider.catalogue if o.material_id == material_id), None)
         if not offering: raise ValueError(f"Provider {provider.name} does not offer {material.name}.")
 
+        if quantity <= 0:
+            raise ValueError(f"Purchase order quantity must be positive. Attempted to order {quantity} of {material.name}.")
+
+
         order_timestamp = utils.get_current_utc_timestamp()
         sim_day_date = (SIMULATION_EPOCH_DATETIME + timedelta(days=self.state.current_day)).date()
         expected_arrival_dt = datetime.combine(sim_day_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=offering.lead_time_days)
@@ -417,11 +434,24 @@ class FactorySimulation:
         po = PurchaseOrder(id=utils.generate_id(), material_id=material_id, provider_id=provider_id,
                            quantity_ordered=quantity, order_date=order_timestamp,
                            expected_arrival_date=expected_arrival_dt, status="Ordered", created_at=order_timestamp)
+        
+        # Ensure state is saved *after* PO is created and added to pending list
+        if po.id not in self.state.pending_purchase_orders: # Should always be true for new PO
+            self.state.pending_purchase_orders.append(po.id)
+        
+        # Save state before creating item in DB, or ensure created_item includes all necessary fields for PO obj
+        # Let's save state first, then create the PO item in DB
+        await crud.save_simulation_state(self.state) 
+        
         po_dict = await crud.create_item(crud.COLLECTIONS["purchase_orders"], po.model_dump())
-        if po.id not in self.state.pending_purchase_orders: self.state.pending_purchase_orders.append(po.id)
+
+
         await self.log_sim_event("purchase_order_placed", {"po_id": po.id, "mat_id": material_id, "prov_id": provider_id, "qty": quantity, "eta": expected_arrival_dt.isoformat()})
         logger.info(f"Placed PO {po.id} for {quantity}x {material.name}. ETA: {expected_arrival_dt.isoformat()}")
-        return PurchaseOrder(**po_dict)
+        
+        # It's safer to reconstruct from the dict returned by CRUD to ensure all DB fields are there
+        return PurchaseOrder(**po_dict) if po_dict else po
+
 
     async def get_item_forecast(self, item_id: str, num_days: int, historical_lookback_days: int = 0) -> ItemForecastResponse:
         if item_id in self.materials:
@@ -436,55 +466,44 @@ class FactorySimulation:
         current_sim_datetime = SIMULATION_EPOCH_DATETIME + timedelta(days=self.state.current_day)
         current_sim_date = current_sim_datetime.date()
         
-        physical_stock = self.state.inventory.get(item_id, 0) # Stock at start of current_day / end of current_day - 1
-        daily_deltas = [0.0] * num_days  # Net change for each day in the forecast period (d_offset 0 to num_days-1)
+        physical_stock = self.state.inventory.get(item_id, 0)
+        daily_deltas = [0.0] * num_days 
 
         forecast_list: List[DailyForecast] = []
 
-        # Historical data points (day_offset from -historical_lookback_days to -1)
         if historical_lookback_days > 0:
             for i in range(historical_lookback_days):
-                # day_offset_val goes from -historical_lookback_days, ..., -1
                 day_offset_val = -historical_lookback_days + i 
-                # actual_day_number_eod is the specific past day for which we want the End-Of-Day stock
                 actual_day_number_eod = self.state.current_day + day_offset_val 
                 forecast_dt = current_sim_date + timedelta(days=day_offset_val)
                 
-                qty_for_this_hist_day = 0.0 # Default if no better data found
+                qty_for_this_hist_day = 0.0 
 
                 if actual_day_number_eod == self.state.current_day - 1:
-                    # For day_offset = -1, the stock is the current physical_stock 
-                    # (which represents stock at the end of day current_day - 1)
                     qty_for_this_hist_day = float(physical_stock)
                 elif actual_day_number_eod < self.state.current_day - 1:
-                    # For days earlier than current_day - 1, query the last known stock
                     latest_event_raw = await crud.get_items(
                         crud.COLLECTIONS["events"],
                         query={
                             "event_type": "inventory_change",
                             "details.item_id": item_id,
-                            "details.inventory_type": "physical", # Ensure physical stock changes
-                            "day": {"$lte": actual_day_number_eod} # Stock at end of this day or any day before it
+                            "details.inventory_type": "physical", 
+                            "day": {"$lte": actual_day_number_eod} 
                         },
                         sort_field="timestamp", 
-                        sort_order=-1, # Get the latest one on or before this day
+                        sort_order=-1, 
                         limit=1
                     )
                     if latest_event_raw:
                         qty_for_this_hist_day = float(latest_event_raw[0].get("details",{}).get("new_quantity", 0.0))
-                    # else: qty_for_this_hist_day remains 0.0 if no event ever found for this item prior to this day
                 
-                # For the earliest days in the historical window, if actual_day_number_eod is very early (e.g. < 0),
-                # and no events are found, qty_for_this_hist_day will be 0.0. This is acceptable.
                 forecast_list.append(DailyForecast(day_offset=day_offset_val, date=forecast_dt, quantity=qty_for_this_hist_day))
 
-        # Calculate future daily deltas (same logic as before for item_type Material or Product)
         if item_type == "Material":
-            # Incoming materials from Purchase Orders
             pending_pos_dicts = await crud.get_items(
                 crud.COLLECTIONS["purchase_orders"],
                 {"status": "Ordered", "material_id": item_id},
-                limit=None # Get all relevant POs
+                limit=None 
             )
             for po_dict in pending_pos_dicts:
                 po = PurchaseOrder(**po_dict)
@@ -492,21 +511,8 @@ class FactorySimulation:
                 if 0 <= arrival_offset < num_days:
                     daily_deltas[arrival_offset] += po.quantity_ordered
             
-            # Outgoing materials for Production Orders
-            # Considers materials committed and consumed during their production cycle.
-            # This includes orders currently "In Progress" and potentially "Accepted" orders
-            # if we were to forecast their start and subsequent material consumption.
-            # For now, focusing on "In Progress" as their start_at is set.
-            # Accepted orders' material impact is immediate on physical stock (committed),
-            # but not on future consumption from physical unless they start production.
-            # The current logic for "Accepted" orders in product forecast is for product output, not material input.
-
             production_orders_consuming_material = await crud.get_items(
                 crud.COLLECTIONS["production_orders"],
-                # We are interested in orders that will consume this material.
-                # Primarily "In Progress". "Accepted" orders have materials already moved from physical to committed.
-                # The forecast should reflect future *physical* stock changes.
-                # So, consumption happens when production *actually* uses it, which is during "In Progress".
                 {"status": "In Progress"}, 
                 limit=None
             )
@@ -524,31 +530,23 @@ class FactorySimulation:
 
                 prod_o_started_at_date = prod_o.started_at.date()
                 production_duration_days = product_def.production_time
-                
-                # Calculate the offset of the production order's start date from the forecast's start date
                 base_start_offset_from_forecast_start = (prod_o_started_at_date - current_sim_date).days
 
-                if production_duration_days <= 0: # Should not happen with valid data
-                    production_duration_days = 1 
+                if production_duration_days <= 0: production_duration_days = 1 
 
                 if production_duration_days == 1:
-                    # All consumption happens on the start day of production
                     consumption_forecast_offset = base_start_offset_from_forecast_start
                     if 0 <= consumption_forecast_offset < num_days:
                         daily_deltas[consumption_forecast_offset] -= total_material_needed_for_order
                 else:
-                    # Multi-day production cycle
                     if total_material_needed_for_order == 1:
-                        # Single unit consumed in the middle of the production cycle
-                        middle_day_of_production_cycle = (production_duration_days - 1) // 2 # 0-indexed
+                        middle_day_of_production_cycle = (production_duration_days - 1) // 2 
                         consumption_forecast_offset = base_start_offset_from_forecast_start + middle_day_of_production_cycle
                         if 0 <= consumption_forecast_offset < num_days:
                             daily_deltas[consumption_forecast_offset] -= 1.0
                     else:
-                        # Multiple units distributed equitably across the production cycle
-                        # daily_consumption_schedule maps day_in_cycle to quantity consumed on that day
                         daily_consumption_schedule = [0.0] * production_duration_days
-                        for i in range(int(total_material_needed_for_order)): # Ensure integer for loop
+                        for i in range(int(total_material_needed_for_order)): 
                             day_index_in_cycle = i % production_duration_days
                             daily_consumption_schedule[day_index_in_cycle] += 1.0
                         
@@ -559,7 +557,6 @@ class FactorySimulation:
                                     daily_deltas[consumption_forecast_offset] -= qty_consumed_on_cycle_day
         
         elif item_type == "Product":
-            # Contributions from in-progress production orders
             in_progress_orders_dicts = await crud.get_items(
                 crud.COLLECTIONS["production_orders"],
                 {"status": "In Progress", "product_id": item_id},
@@ -569,41 +566,30 @@ class FactorySimulation:
                 prod_o = ProductionOrder(**prod_o_dict)
                 product_def = self.products.get(prod_o.product_id)
                 if product_def and prod_o.started_at:
-                    # Ensure started_at is timezone-aware or naive consistent with current_sim_date
                     started_at_date = prod_o.started_at.date()
                     completion_date = started_at_date + timedelta(days=product_def.production_time)
                     completion_offset = (completion_date - current_sim_date).days
                     if 0 <= completion_offset < num_days:
                         daily_deltas[completion_offset] += prod_o.quantity
 
-            # Demand from accepted orders (fulfilled from stock)
-            # This assumes fulfillment happens on day 0 of the forecast period if stock allows.
             accepted_orders_dicts = await crud.get_items(
                 crud.COLLECTIONS["production_orders"],
                 {"status": "Accepted", "product_id": item_id},
                 limit=None,
-                sort_field="requested_date", # Prioritize older requests
+                sort_field="requested_date", 
                 sort_order=1 
             )
             
-            # Simulate fulfillment of accepted orders from stock for the forecast
-            simulated_physical_for_fulfillment = float(physical_stock) # Start with current physical
-            # Adjust simulated_physical_for_fulfillment based on production completions on day 0
-            # This part can get complex if production on day 0 also feeds into this.
-            # For simplicity, let's assume day 0 production output is not available for day 0 accepted order fulfillment.
-            # Or, more simply, assume daily_deltas[0] for production is already accounted if it happens before fulfillment.
-            # Let's keep it simple: use initial physical_stock for this check.
-
+            simulated_physical_for_fulfillment = float(physical_stock)
             for acc_o_dict in accepted_orders_dicts:
                 acc_o = ProductionOrder(**acc_o_dict)
                 if simulated_physical_for_fulfillment >= acc_o.quantity:
-                    daily_deltas[0] -= acc_o.quantity  # Demand on day 0
+                    daily_deltas[0] -= acc_o.quantity
                     simulated_physical_for_fulfillment -= acc_o.quantity
         
-        # Projected future points (day_offset from 0 to num_days-1)
-        running_balance = float(physical_stock) # Initialize with stock at start of current day (end of day_offset -1)
-        for d_offset in range(num_days): # d_offset = 0, 1, ..., num_days-1
-            running_balance += daily_deltas[d_offset] # Add net change for the current forecast day
+        running_balance = float(physical_stock)
+        for d_offset in range(num_days): 
+            running_balance += daily_deltas[d_offset]
             forecast_dt = current_sim_date + timedelta(days=d_offset)
             forecast_list.append(
                 DailyForecast(day_offset=d_offset, date=forecast_dt, quantity=running_balance)
