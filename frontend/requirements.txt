@@ -1,5 +1,5 @@
 streamlit==1.37.0
-requests==2.31.0
+requests==2.32.2
 pandas==2.2.2
 plotly==5.22.0 # For more advanced charts if needed
 python-dotenv==1.0.1
