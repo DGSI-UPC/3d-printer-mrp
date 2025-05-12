@@ -240,7 +240,14 @@ elif page == "Finances":
     if not st.session_state.simulation_status:
         st.warning("Simulation not initialized. Financial data unavailable. Go to 'Setup & Data'.")
     else:
-        forecast_horizon = st.slider("Select forecast horizon (days for charts):", 7, 30, 7, key="fin_forecast_days_slider")
+        # Replace slider with selectbox for forecast horizon
+        forecast_horizon_options = [7, 14, 30]
+        forecast_horizon = st.selectbox(
+            "Select forecast horizon (days for charts):",
+            options=forecast_horizon_options,
+            index=0,  # Default to 7 days
+            key="fin_forecast_days_select"
+        )
         financial_page_data = load_financial_data_cached(forecast_days=forecast_horizon)
 
         if financial_page_data:
@@ -256,49 +263,154 @@ elif page == "Finances":
             col_s4.metric("Profit (to date)", f"{summary.get('profit_to_date', 0.0):,.2f} EUR",
                           delta_color=("inverse" if summary.get('profit_to_date', 0.0) < 0 else "normal"))
 
+            history_df = pd.DataFrame()
+            current_day_vline_date = None
             if history:
                 history_df = pd.DataFrame(history)
-                history_df['date'] = pd.to_datetime(history_df['date'])
+                if not history_df.empty:
+                    history_df['date'] = pd.to_datetime(history_df['date'])
+                    history_df = history_df.sort_values(by='date', ascending=True)
+                    if not history_df.empty:
+                        current_day_vline_date = history_df['date'].iloc[-1]
 
-                st.subheader("Historical Financial Performance")
-                fig_hist_balance = px.line(history_df, x='date', y='balance', title='Balance Over Time', markers=True,
-                                           labels={'balance': 'Balance (EUR)', 'date': 'Date'})
-                fig_hist_balance.update_traces(line=dict(color='green'))
-                st.plotly_chart(fig_hist_balance, use_container_width=True)
-
-                # Combined Daily Financials Chart
-                fig_daily_hist = go.Figure()
-                fig_daily_hist.add_trace(go.Bar(x=history_df['date'], y=history_df['revenue'], name='Revenue', marker_color='blue'))
-                fig_daily_hist.add_trace(go.Bar(x=history_df['date'], y=history_df['material_costs'], name='Material Costs', marker_color='orange'))
-                fig_daily_hist.add_trace(go.Bar(x=history_df['date'], y=history_df['operational_costs'], name='Operational Costs', marker_color='red'))
-                fig_daily_hist.add_trace(go.Scatter(x=history_df['date'], y=history_df['profit'], name='Daily Profit', mode='lines+markers', line=dict(color='purple', dash='dot')))
-                fig_daily_hist.update_layout(barmode='relative', title_text='Daily Financial Flows (Historical)', xaxis_title='Date', yaxis_title='Amount (EUR)')
-                st.plotly_chart(fig_daily_hist, use_container_width=True)
-
-            else:
-                st.info("No historical financial data to display.")
-
+            forecast_df = pd.DataFrame()
             if forecast:
                 forecast_df = pd.DataFrame(forecast)
-                forecast_df['date'] = pd.to_datetime(forecast_df['date'])
+                if not forecast_df.empty:
+                    forecast_df['date'] = pd.to_datetime(forecast_df['date'])
+                    forecast_df = forecast_df.sort_values(by='date', ascending=True)
 
-                st.subheader(f"Financial Forecast ({forecast_horizon} Days)")
-                fig_forecast_balance = px.line(forecast_df, x='date', y='projected_balance', title='Projected Balance Over Time', markers=True,
-                                               labels={'projected_balance': 'Projected Balance (EUR)', 'date': 'Date'})
-                fig_forecast_balance.update_traces(line=dict(color='teal', dash='dash'))
-                st.plotly_chart(fig_forecast_balance, use_container_width=True)
+            st.subheader(f"Financial Performance & Projection (Forecast: {forecast_horizon} Days)")
 
-                # Combined Daily Forecast Financials Chart
-                fig_daily_forecast = go.Figure()
-                fig_daily_forecast.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_revenue'], name='Projected Revenue', marker_color='lightblue'))
-                fig_daily_forecast.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_material_costs'], name='Projected Material Costs', marker_color='lightsalmon')) # Should be low if paid on order
-                fig_daily_forecast.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_operational_costs'], name='Projected Operational Costs', marker_color='pink'))
-                fig_daily_forecast.add_trace(go.Scatter(x=forecast_df['date'], y=forecast_df['projected_profit'], name='Projected Daily Profit', mode='lines+markers', line=dict(color='indigo', dash='dot')))
-                fig_daily_forecast.update_layout(barmode='relative', title_text='Projected Daily Financial Flows', xaxis_title='Date', yaxis_title='Amount (EUR)')
-                st.plotly_chart(fig_daily_forecast, use_container_width=True)
+            # Combined Balance Chart
+            fig_balance_overview = go.Figure()
+            has_balance_data = False
 
+            plot_forecast_balance_dates = pd.Series(dtype='datetime64[ns]')
+            plot_forecast_balance_values = pd.Series(dtype='float64')
+
+            if not history_df.empty:
+                fig_balance_overview.add_trace(go.Scatter(
+                    x=history_df['date'], y=history_df['balance'], name='Historical/Current Balance',
+                    mode='lines+markers', line=dict(color='royalblue', dash='dash')
+                ))
+                has_balance_data = True
+
+                if not forecast_df.empty and 'projected_balance' in forecast_df.columns:
+                    last_hist_date = history_df['date'].iloc[-1]
+                    last_hist_balance = history_df['balance'].iloc[-1]
+                    
+                    temp_forecast_df_balance = forecast_df.copy()
+                    if not temp_forecast_df_balance.empty:
+                        first_forecast_date = temp_forecast_df_balance['date'].iloc[0]
+                        # Ensure forecast data for plotting starts from the last historical point to connect lines
+                        if first_forecast_date == last_hist_date:
+                            # If forecast starts on the same day, ensure its first point matches history's last
+                            temp_forecast_df_balance.loc[temp_forecast_df_balance.index[0], 'projected_balance'] = last_hist_balance
+                            plot_forecast_balance_dates = temp_forecast_df_balance['date']
+                            plot_forecast_balance_values = temp_forecast_df_balance['projected_balance']
+                        elif first_forecast_date > last_hist_date:
+                             # Prepend last historical point to forecast data for a continuous line
+                            connection_point_date = pd.Series([last_hist_date], index=[-1])
+                            connection_point_balance = pd.Series([last_hist_balance], index=[-1])
+                            plot_forecast_balance_dates = pd.concat([connection_point_date, temp_forecast_df_balance['date']]).reset_index(drop=True)
+                            plot_forecast_balance_values = pd.concat([connection_point_balance, temp_forecast_df_balance['projected_balance']]).reset_index(drop=True)
+                        else: # Fallback if forecast data is somehow before last history (should not happen with sorted data)
+                            plot_forecast_balance_dates = temp_forecast_df_balance['date']
+                            plot_forecast_balance_values = temp_forecast_df_balance['projected_balance']
+
+            elif not forecast_df.empty and 'projected_balance' in forecast_df.columns: # Only forecast, no history
+                plot_forecast_balance_dates = forecast_df['date']
+                plot_forecast_balance_values = forecast_df['projected_balance']
+
+            if not plot_forecast_balance_dates.empty:
+                 fig_balance_overview.add_trace(go.Scatter(
+                    x=plot_forecast_balance_dates, y=plot_forecast_balance_values, name='Projected Balance',
+                    mode='lines+markers', line=dict(color='darkorange')
+                ))
+                 has_balance_data = True
+            
+            if has_balance_data:
+                fig_balance_overview.update_layout(
+                    title_text='Balance Over Time (Historical & Projected)',
+                    xaxis_title='Date', yaxis_title='Balance (EUR)',
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                if current_day_vline_date:
+                    fig_balance_overview.add_vline(x=current_day_vline_date, line_width=2, line_dash="solid", line_color="green")
+                    fig_balance_overview.add_annotation(
+                        x=current_day_vline_date, y=1.03, yref="paper", text="Current Day",
+                        showarrow=False, font=dict(color="green", size=12),
+                        xanchor="center", yanchor="bottom"
+                    )
+                st.plotly_chart(fig_balance_overview, use_container_width=True)
             else:
-                st.info("No financial forecast data to display.")
+                st.info("No balance data (historical or forecast) to display.")
+
+            # Combined Daily Financial Flows Chart
+            fig_flows_overview = go.Figure()
+            has_flows_data = False
+
+            plot_forecast_profit_dates = pd.Series(dtype='datetime64[ns]')
+            plot_forecast_profit_values = pd.Series(dtype='float64')
+
+            if not history_df.empty and 'profit' in history_df.columns:
+                fig_flows_overview.add_trace(go.Bar(x=history_df['date'], y=history_df['revenue'], name='Revenue (Hist.)', marker_color='blue'))
+                fig_flows_overview.add_trace(go.Bar(x=history_df['date'], y=history_df['material_costs'], name='Material Costs (Hist.)', marker_color='orange'))
+                fig_flows_overview.add_trace(go.Bar(x=history_df['date'], y=history_df['operational_costs'], name='Operational Costs (Hist.)', marker_color='red'))
+                fig_flows_overview.add_trace(go.Scatter(x=history_df['date'], y=history_df['profit'], name='Daily Profit (Hist.)', mode='lines+markers', line=dict(color='purple', dash='solid')))
+                has_flows_data = True
+
+                if not forecast_df.empty and 'projected_profit' in forecast_df.columns:
+                    last_hist_date_profit = history_df['date'].iloc[-1]
+                    last_hist_profit = history_df['profit'].iloc[-1]
+                    
+                    temp_forecast_df_profit = forecast_df.copy()
+                    if not temp_forecast_df_profit.empty:
+                        first_forecast_date_profit = temp_forecast_df_profit['date'].iloc[0]
+                        if first_forecast_date_profit == last_hist_date_profit:
+                            temp_forecast_df_profit.loc[temp_forecast_df_profit.index[0], 'projected_profit'] = last_hist_profit
+                            plot_forecast_profit_dates = temp_forecast_df_profit['date']
+                            plot_forecast_profit_values = temp_forecast_df_profit['projected_profit']
+                        elif first_forecast_date_profit > last_hist_date_profit:
+                            connection_point_date_profit = pd.Series([last_hist_date_profit], index=[-1])
+                            connection_point_profit = pd.Series([last_hist_profit], index=[-1])
+                            plot_forecast_profit_dates = pd.concat([connection_point_date_profit, temp_forecast_df_profit['date']]).reset_index(drop=True)
+                            plot_forecast_profit_values = pd.concat([connection_point_profit, temp_forecast_df_profit['projected_profit']]).reset_index(drop=True)
+                        else:
+                            plot_forecast_profit_dates = temp_forecast_df_profit['date']
+                            plot_forecast_profit_values = temp_forecast_df_profit['projected_profit']
+            
+            elif not forecast_df.empty and 'projected_profit' in forecast_df.columns: 
+                plot_forecast_profit_dates = forecast_df['date']
+                plot_forecast_profit_values = forecast_df['projected_profit']
+
+            if not forecast_df.empty:
+                if 'projected_revenue' in forecast_df.columns:
+                    fig_flows_overview.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_revenue'], name='Revenue (Proj.)', marker_color='lightblue'))
+                    has_flows_data = True
+                if 'projected_material_costs' in forecast_df.columns:
+                    fig_flows_overview.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_material_costs'], name='Material Costs (Proj.)', marker_color='lightsalmon'))
+                    has_flows_data = True
+                if 'projected_operational_costs' in forecast_df.columns:
+                    fig_flows_overview.add_trace(go.Bar(x=forecast_df['date'], y=forecast_df['projected_operational_costs'], name='Operational Costs (Proj.)', marker_color='pink'))
+                    has_flows_data = True
+
+            if not plot_forecast_profit_dates.empty:
+                fig_flows_overview.add_trace(go.Scatter(
+                    x=plot_forecast_profit_dates, y=plot_forecast_profit_values, name='Daily Profit (Proj.)',
+                    mode='lines+markers', line=dict(color='indigo', dash='dot')
+                ))
+                has_flows_data = True
+            
+            if has_flows_data:
+                # Changed barmode to 'group'
+                fig_flows_overview.update_layout(barmode='group', title_text='Daily Financial Flows (Historical & Projected)', xaxis_title='Date', yaxis_title='Amount (EUR)', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                if current_day_vline_date: 
+                    fig_flows_overview.add_vline(x=current_day_vline_date, line_width=2, line_dash="solid", line_color="green")
+                st.plotly_chart(fig_flows_overview, use_container_width=True)
+            else:
+                st.info("No daily financial flow data (historical or forecast) to display.")
         else:
             st.error("Could not retrieve financial data. The simulation might not be initialized or an API error occurred.")
 
